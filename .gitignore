@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# Credentials
+.env
+runtime_credentials/
+*.pem
+*.key
+
+# SuanQi runtime
+.suanqi/
+suanqi_runtime/

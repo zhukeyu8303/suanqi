@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "suanqi"
+version = "0.1.0"
+description = "Run compute tasks on temporary cloud servers from a local command."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+
+authors = [
+    { name = "Keyu Zhu" }
+]
+
+keywords = [
+    "cloud-computing",
+    "tencent-cloud",
+    "cvm",
+    "cli",
+    "remote-execution",
+    "spot-instance"
+]
+
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Systems Administration"
+]
+
+dependencies = [
+    "tencentcloud-sdk-python>=3.0.0",
+    "datetime"
+]
+
+
+[project.urls]
+Homepage = "https://github.com/zhukeyu8303/SuanQi"
+Repository = "https://github.com/zhukeyu8303/SuanQi"
+Issues = "https://github.com/zhukeyu8303/SuanQi/issues"
+
+
+[project.scripts]
+suanqi = "suanqi.cli:main"
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
