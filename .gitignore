@@ -26,3 +26,5 @@ runtime_credentials/
 .suanqi/
 suanqi_runtime/
 .suanqi-results/
+
+main.py

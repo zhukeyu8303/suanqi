@@ -47,15 +47,22 @@ class RemoteCommandResult:
 
 @dataclass(slots=True)
 class PreparedTask:
-    """已经准备完成的任务。"""
+    """已经上传完成、等待 worker 执行的任务。"""
 
     task_id: str
     task_root: str
     user_directory: str
     control_directory: str
+
     main_file: str
+    # main_file 是服务器上的 main.py 完整路径
+
     requirements_file: str | None
+    # requirements_file 是服务器上的 requirements.txt 完整路径
+    # 没有 requirements.txt 时为 None
+
     virtualenv_python: str
+    # virtualenv_python 是未来由 worker 创建的虚拟环境 Python 路径
 
 
 @dataclass(slots=True)
@@ -606,11 +613,27 @@ def prepare_python_task(
     server: ServerInfo,
     python_file: str | Path,
     requirements_file: str | Path | None,
-    packages: list[str],
 ) -> PreparedTask:
-    """上传任务并准备环境。"""
+    """
+    上传任务文件。
+
+    此函数只负责：
+
+    1. 创建远程任务目录
+    2. 上传 main.py
+    3. 可选上传 requirements.txt
+
+    不再负责：
+
+    1. 创建虚拟环境
+    2. 安装 requirements.txt
+    3. 安装 -i 指定的软件包
+
+    上述环境准备工作全部交给远程 worker。
+    """
 
     task_id = generate_task_id()
+
     directories = create_remote_task_directory(
         server,
         task_id,
@@ -623,50 +646,29 @@ def prepare_python_task(
     print("正在上传 Python 文件……")
 
     main_file = upload_task_file(
-        server,
-        python_file,
-        user_directory,
-        "main.py",
+        server=server,
+        local_path=python_file,
+        user_directory=user_directory,
+        remote_filename="main.py",
     )
 
-    remote_requirements = None
+    remote_requirements: str | None = None
 
     if requirements_file is not None:
         print("正在上传 requirements.txt……")
 
         remote_requirements = upload_task_file(
-            server,
-            requirements_file,
-            user_directory,
-            "requirements.txt",
+            server=server,
+            local_path=requirements_file,
+            user_directory=user_directory,
+            remote_filename="requirements.txt",
         )
-
-    print("正在创建 Python 虚拟环境……")
 
     virtualenv_python = (
-        create_virtual_environment(
-            server,
-            user_directory,
-        )
+        f"{user_directory}/.venv/bin/python"
     )
-
-    if remote_requirements is not None:
-        print("正在安装 requirements.txt……")
-        install_requirements(
-            server,
-            user_directory,
-        )
-
-    if packages:
-        print(
-            "正在安装额外依赖："
-            + ", ".join(packages)
-        )
-        install_packages(
-            server,
-            user_directory,
-            packages,
-        )
+    # virtualenv_python 是 worker 创建虚拟环境后，
+    # 虚拟环境中 Python 的固定路径
 
     return PreparedTask(
         task_id=task_id,
@@ -679,7 +681,6 @@ def prepare_python_task(
         requirements_file=remote_requirements,
         virtualenv_python=virtualenv_python,
     )
-
 
 def write_remote_root_file(
     server: ServerInfo,
@@ -738,20 +739,66 @@ def start_worker_task(
     task: PreparedTask,
     return_files: list[str],
     local_worker_path: str | Path,
+    packages: list[str] | None = None,
+    max_use_seconds: int = 5 * 60 * 60,
+    terminate_grace_seconds: int = 30,
+    preparation_timeout_seconds: int = 2 * 60 * 60,
 ) -> WorkerTask:
-    """启动 systemd 守护任务。"""
+    """
+    上传并启动 systemd 守护任务。
+
+    参数：
+        packages：
+            用户通过 -i 指定的 Python 软件包。
+
+        max_use_seconds：
+            main.py 最大运行时间，单位秒。
+            不包含创建虚拟环境和安装依赖的时间。
+
+        terminate_grace_seconds：
+            main.py 超时后发送 SIGTERM，
+            等待程序自行退出的时间。
+
+        preparation_timeout_seconds：
+            创建虚拟环境和安装依赖的最大总时间。
+            默认 2 小时。
+    """
+
+    if max_use_seconds <= 0:
+        raise ValueError(
+            "max_use_seconds 必须大于 0"
+        )
+
+    if terminate_grace_seconds < 0:
+        raise ValueError(
+            "terminate_grace_seconds 不能小于 0"
+        )
+
+    if preparation_timeout_seconds <= 0:
+        raise ValueError(
+            "preparation_timeout_seconds 必须大于 0"
+        )
+
+    cleaned_packages = [
+        package.strip()
+        for package in (packages or [])
+        if package.strip()
+    ]
+    # cleaned_packages 是去除空字符串后的依赖列表
 
     worker_path = (
         "/opt/suanqi/worker/suanqi_worker.py"
     )
 
     write_remote_root_file(
-        server,
-        worker_path,
-        Path(local_worker_path).read_text(
+        server=server,
+        remote_path=worker_path,
+        content=Path(
+            local_worker_path
+        ).read_text(
             encoding="utf-8"
         ),
-        0o700,
+        mode=0o700,
     )
 
     safe_return_files = [
@@ -763,24 +810,59 @@ def start_worker_task(
         f"{task.control_directory}/task.json"
     )
 
+    requirements_filename = (
+        "requirements.txt"
+        if task.requirements_file is not None
+        else None
+    )
+
     config = {
         "task_id": task.task_id,
-        "user_directory": task.user_directory,
-        "control_directory": task.control_directory,
+
+        "user_directory": (
+            task.user_directory
+        ),
+
+        "control_directory": (
+            task.control_directory
+        ),
+
         "main_filename": "main.py",
-        "virtualenv_python": task.virtualenv_python,
+
+        "requirements_filename": (
+            requirements_filename
+        ),
+
+        "packages": cleaned_packages,
+
+        "virtualenv_python": (
+            task.virtualenv_python
+        ),
+
         "return_files": safe_return_files,
+
+        "max_use_seconds": (
+            max_use_seconds
+        ),
+
+        "terminate_grace_seconds": (
+            terminate_grace_seconds
+        ),
+
+        "preparation_timeout_seconds": (
+            preparation_timeout_seconds
+        ),
     }
 
     write_remote_root_file(
-        server,
-        config_path,
-        json.dumps(
+        server=server,
+        remote_path=config_path,
+        content=json.dumps(
             config,
             ensure_ascii=False,
             indent=2,
         ),
-        0o600,
+        mode=0o600,
     )
 
     service_name = (
@@ -812,10 +894,10 @@ WantedBy=multi-user.target
 """
 
     write_remote_root_file(
-        server,
-        service_path,
-        service_content,
-        0o644,
+        server=server,
+        remote_path=service_path,
+        content=service_content,
+        mode=0o644,
     )
 
     execute_remote_command(
@@ -836,7 +918,9 @@ WantedBy=multi-user.target
         service_name=service_name,
         task_root=task.task_root,
         user_directory=task.user_directory,
-        control_directory=task.control_directory,
+        control_directory=(
+            task.control_directory
+        ),
         status_path=(
             f"{task.control_directory}/status.json"
         ),
@@ -847,7 +931,6 @@ WantedBy=multi-user.target
             f"{task.control_directory}/manifest.json"
         ),
     )
-
 
 def read_root_json_file(
     server: ServerInfo,
@@ -934,11 +1017,20 @@ def follow_worker_task(
     """实时读取任务日志直到结束。"""
 
     offset = 0
+    # offset 代表已经读取到的日志字节位置
+
     terminal_statuses = {
         "SUCCESS",
         "FAILED",
+        "TIMEOUT",
         "WORKER_FAILED",
     }
+    # terminal_statuses 是所有最终状态
+    # 遇到其中一个状态后停止轮询
+
+    last_status_name: str | None = None
+    # last_status_name 保存上一次读取到的状态
+    # 用于避免重复输出状态变化
 
     while True:
         try:
@@ -963,12 +1055,79 @@ def follow_worker_task(
                 worker_task.status_path,
             )
 
-            if (
-                status is not None
-                and status.get("status")
-                in terminal_statuses
-            ):
-                return status
+            if status is not None:
+                status_name = (
+                    status.get("status")
+                    or status.get("state")
+                )
+                # 目前 worker 使用 status 字段
+                # 同时兼容未来可能使用的 state 字段
+
+                if (
+                    status_name
+                    and status_name
+                    != last_status_name
+                ):
+                    last_status_name = status_name
+
+                    if status_name == "STARTING":
+                        print(
+                            "\n远程任务正在启动……"
+                        )
+
+                    elif status_name == "RUNNING":
+                        print(
+                            "\n远程任务正在运行……"
+                        )
+
+                    elif status_name == "TIMEOUT":
+                        print(
+                            "\n任务达到最大运行时间，"
+                            "远程程序已停止。"
+                        )
+
+                    elif status_name == "SUCCESS":
+                        print(
+                            "\n远程任务运行成功。"
+                        )
+
+                    elif status_name == "FAILED":
+                        print(
+                            "\n远程任务运行失败。"
+                        )
+
+                    elif status_name == "WORKER_FAILED":
+                        print(
+                            "\n远程守护进程运行失败。"
+                        )
+
+                    elif status_name == "PREPARING":
+                        print(
+                            "\n远程任务正在准备 Python 环境……"
+                        )
+
+                if status_name in terminal_statuses:
+                    # 最后再读一次日志
+                    # 避免状态文件先更新，最后几行日志未显示
+                    final_data, offset = (
+                        read_root_log_chunk(
+                            server,
+                            worker_task.task_log_path,
+                            offset,
+                        )
+                    )
+
+                    if final_data:
+                        print(
+                            final_data.decode(
+                                "utf-8",
+                                errors="replace",
+                            ),
+                            end="",
+                            flush=True,
+                        )
+
+                    return status
 
         except (
             paramiko.SSHException,
@@ -980,10 +1139,10 @@ def follow_worker_task(
                 "\nSSH 连接中断，远程任务仍在运行，"
                 "正在重新连接……"
             )
+
             wait_for_ssh(server)
 
         time.sleep(1)
-
 
 def validate_return_path(
     return_path: str,

@@ -12,6 +12,8 @@ from .instance_manager import (
     release_suanqi_instance,
 )
 from .providers import tencentcloud_run
+from .utils.resource_utils import resolve_resource_requirements
+from .utils.time_utils import parse_duration
 
 
 def _parse_return_files(value: str) -> list[str]:
@@ -36,116 +38,242 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="suanqi",
-        description="创建云服务器并运行 Python 计算任务。",
+        description=(
+            "SuanQi：自动创建云服务器，"
+            "运行 Python 计算任务并下载结果。"
+        ),
+        epilog=(
+            "常用示例：\n"
+            "  suanqi run main.py\n"
+            "  suanqi run main.py --cpu 32\n"
+            "  suanqi run main.py --memory 64\n"
+            "  suanqi run main.py --cpu 32 --memory 64\n"
+            "  suanqi run main.py --maxusetime 1h30m\n"
+            "  suanqi run main.py -r requirements.txt\n"
+            "  suanqi run main.py -i numpy -i pandas\n"
+            "  suanqi run main.py --return result.xlsx,output.txt\n"
+            "  suanqi run main.py --keep\n"
+            "  suanqi --list\n"
+            "  suanqi release ins-xxxxxxxx\n"
+            "\n"
+            "资源联动规则：\n"
+            "  不指定 CPU 和内存：默认至少 16 核、16GB\n"
+            "  只指定 --cpu 32：至少 32 核、32GB\n"
+            "  只指定 --memory 64：至少 64 核、64GB\n"
+            "  同时指定：CPU 和内存分别使用指定值\n"
+            "\n"
+            "时间格式：\n"
+            "  30s      30 秒\n"
+            "  20m      20 分钟\n"
+            "  5h       5 小时\n"
+            "  1h30m    1 小时 30 分钟\n"
+            "  1d2h     1 天 2 小时\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument(
+    general_group = parser.add_argument_group(
+        "全局选项"
+    )
+
+    general_group.add_argument(
         "-l",
         "--list",
         action="store_true",
         dest="list_instances",
-        help="列出所有由 SuanQi 管理的实例。",
+        help="列出所有由 SuanQi 创建和管理的实例。",
     )
 
     subparsers = parser.add_subparsers(
         dest="command",
+        title="可用命令",
+        metavar="COMMAND",
+        description=(
+            "使用 suanqi COMMAND -h "
+            "查看某个命令的详细帮助。"
+        ),
     )
 
     run_parser = subparsers.add_parser(
         "run",
-        help="在云服务器上运行单个 Python 文件。",
+        help="创建云服务器并运行 Python 文件。",
+        description=(
+            "自动筛选并创建云服务器，准备 Python 环境，"
+            "上传程序、安装依赖、运行任务并下载结果。"
+        ),
+        epilog=(
+            "示例：\n"
+            "  suanqi run main.py\n"
+            "  suanqi run main.py --cpu 32 --maxusetime 2h\n"
+            "  suanqi run main.py -r requirements.txt\n"
+            "  suanqi run main.py -i numpy -i pandas\n"
+            "  suanqi run main.py --return result.xlsx,task.log\n"
+            "\n"
+            "注意：\n"
+            "  --maxusetime 只计算用户程序真正运行的时间，\n"
+            "  不包含创建服务器、等待 SSH 和安装依赖的时间。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     run_parser.add_argument(
         "python_file",
         type=Path,
-        help="需要上传并执行的 Python 文件。",
+        metavar="PYTHON_FILE",
+        help="需要上传并执行的 Python 文件，目前仅支持单个 .py 文件。",
     )
 
-    run_parser.add_argument(
+    environment_group = (
+        run_parser.add_argument_group(
+            "运行环境"
+        )
+    )
+
+    environment_group.add_argument(
         "--provider",
         default="tencentcloud",
         choices=["tencentcloud"],
-        help="云服务提供商。",
+        help="云服务提供商，当前仅支持腾讯云（默认：tencentcloud）。",
     )
 
-    run_parser.add_argument(
+    environment_group.add_argument(
         "-r",
         "--requirements",
         type=Path,
         default=None,
-        help="可选的 requirements.txt 文件。",
+        metavar="FILE",
+        help="需要上传并安装的 requirements.txt 文件。",
     )
 
-    run_parser.add_argument(
+    environment_group.add_argument(
         "-i",
         "--install",
         action="append",
         default=[],
         metavar="PACKAGE",
-        help="额外安装一个 Python 包，可重复使用。",
+        help=(
+            "额外安装一个 Python 包，可重复使用，"
+            "例如 -i numpy -i pandas。"
+        ),
     )
 
-    run_parser.add_argument(
+    resource_group = run_parser.add_argument_group(
+        "实例资源"
+    )
+
+    resource_group.add_argument(
+        "--cpu",
+        type=int,
+        default=None,
+        metavar="CORES",
+        help=(
+            "最低 CPU 核心数。只指定 CPU 时，"
+            "最低内存 GB 数自动设为相同数值。"
+        ),
+    )
+
+    resource_group.add_argument(
+        "--memory",
+        type=int,
+        default=None,
+        metavar="GB",
+        help=(
+            "最低内存大小，单位 GB。只指定内存时，"
+            "最低 CPU 核心数自动设为相同数值。"
+        ),
+    )
+
+    resource_group.add_argument(
+        "--maximum-region-instances",
+        type=int,
+        default=10,
+        metavar="COUNT",
+        help="每个地域最多保留的候选机型数量（默认：10）。",
+    )
+
+    task_group = run_parser.add_argument_group(
+        "任务控制"
+    )
+
+    task_group.add_argument(
+        "--maxusetime",
+        type=str,
+        default="5h",
+        metavar="DURATION",
+        help=(
+            "用户程序最大运行时间（默认：5h）。"
+            "支持 30s、20m、5h、1h30m、1d2h。"
+        ),
+    )
+
+    task_group.add_argument(
         "--return",
         dest="return_files",
         type=_parse_return_files,
         default=[],
         metavar="FILES",
-        help="任务结束后下载的文件，多个文件用逗号分隔。",
+        help=(
+            "任务结束后下载的文件，多个文件使用逗号分隔。"
+            "例如 --return result.xlsx,output.txt。"
+        ),
     )
 
-    run_parser.add_argument(
-        "--cpu",
-        type=int,
-        default=16,
-        help="实例最低 CPU 核心数，默认 16。",
-    )
-
-    run_parser.add_argument(
-        "--memory",
-        type=int,
-        default=16,
-        help="实例最低内存，单位 GB，默认 16。",
-    )
-
-    run_parser.add_argument(
-        "--maximum-region-instances",
-        type=int,
-        default=10,
-        help="每个地域最多保留的候选机型数量。",
-    )
-
-    run_parser.add_argument(
+    task_group.add_argument(
         "--keep",
         action="store_true",
-        help="任务结束后保留实例。",
+        help=(
+            "任务结束后保留云服务器。"
+            "启用后服务器可能继续产生费用。"
+        ),
     )
 
     release_parser = subparsers.add_parser(
         "release",
         help="强制释放指定的 SuanQi 实例。",
+        description=(
+            "强制释放由 SuanQi 创建和管理的腾讯云实例。"
+            "实例中的未下载文件可能永久丢失。"
+        ),
+        epilog=(
+            "示例：\n"
+            "  suanqi release ins-xxxxxxxx\n"
+            "  suanqi release ins-xxxxxxxx --yes"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     release_parser.add_argument(
         "instance_id",
-        help="需要释放的腾讯云实例 ID。",
+        metavar="INSTANCE_ID",
+        help="需要释放的腾讯云实例 ID，例如 ins-xxxxxxxx。",
     )
 
     release_parser.add_argument(
         "--yes",
         action="store_true",
-        help="跳过 RELEASE 二次确认。",
+        help="跳过输入 RELEASE 的二次确认。",
     )
 
     return parser
-
 
 def _validate_run_arguments(
     parser: argparse.ArgumentParser,
     arguments: argparse.Namespace,
 ) -> None:
-    """检查 run 命令参数。"""
+    """
+    检查 run 命令参数，并计算最终资源要求。
+
+    检查完成后会新增或更新：
+
+    arguments.cpu：
+        最终最低 CPU 核心数。
+
+    arguments.memory：
+        最终最低内存大小，单位 GB。
+
+    arguments.max_use_seconds：
+        最大运行时间，单位秒。
+    """
 
     python_file = (
         arguments.python_file
@@ -174,21 +302,42 @@ def _validate_run_arguments(
 
         if not requirements_file.is_file():
             parser.error(
-                f"requirements 文件不存在：{requirements_file}"
+                f"requirements 文件不存在："
+                f"{requirements_file}"
             )
 
         arguments.requirements = requirements_file
 
-    if arguments.cpu <= 0:
-        parser.error("--cpu 必须大于 0")
+    try:
+        # 根据 CPU 和内存联动规则，计算最终最低资源要求
+        minimum_cpu, minimum_memory_gb = (
+            resolve_resource_requirements(
+                cpu=arguments.cpu,
+                memory_gb=arguments.memory,
+            )
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
-    if arguments.memory <= 0:
-        parser.error("--memory 必须大于 0")
+    try:
+        # 将 5h、1h30m 等格式转换为秒数
+        max_use_seconds = parse_duration(
+            arguments.maxusetime
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
     if arguments.maximum_region_instances <= 0:
         parser.error(
             "--maximum-region-instances 必须大于 0"
         )
+
+    # 将联动计算后的最终值写回 arguments
+    arguments.cpu = minimum_cpu
+    arguments.memory = minimum_memory_gb
+
+    # 新增最大运行秒数字段
+    arguments.max_use_seconds = max_use_seconds
 
 
 def list_instances_command() -> int:
@@ -332,6 +481,16 @@ def run_command(
         arguments,
     )
 
+    print("\n任务参数：")
+    print(f"Python 文件：{arguments.python_file}")
+    print(f"最低 CPU：{arguments.cpu} 核")
+    print(f"最低内存：{arguments.memory} GB")
+    print(
+        "最大运行时间："
+        f"{arguments.maxusetime} "
+        f"（{arguments.max_use_seconds} 秒）"
+    )
+
     result = tencentcloud_run(
         python_file=arguments.python_file,
         requirements_file=arguments.requirements,
@@ -343,6 +502,9 @@ def run_command(
             arguments.maximum_region_instances
         ),
         keep_instance=arguments.keep,
+
+        # 用户程序最大运行时间，单位秒
+        max_use_seconds=arguments.max_use_seconds,
     )
 
     if not result:
