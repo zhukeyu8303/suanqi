@@ -12,6 +12,16 @@ from .instance_manager import (
     release_suanqi_instance,
 )
 from .providers import tencentcloud_run
+from .remote import (
+    ServerInfo,
+    WorkerTask,
+    attach_worker_task,
+    wait_for_ssh,
+)
+from .task_store import (
+    load_task_record,
+    update_task_record,
+)
 from .utils.resource_utils import resolve_resource_requirements
 from .utils.time_utils import parse_duration
 
@@ -54,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  suanqi run main.py --return result.xlsx,output.txt\n"
             "  suanqi run main.py --keep\n"
             "  suanqi --list\n"
+            "  suanqi attach ins-xxxxxxxx\n"
             "  suanqi release ins-xxxxxxxx\n"
             "\n"
             "资源联动规则：\n"
@@ -98,8 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
         "run",
         help="创建云服务器并运行 Python 文件。",
         description=(
-            "自动筛选并创建云服务器，准备 Python 环境，"
-            "上传程序、安装依赖、运行任务并下载结果。"
+            "自动筛选并创建云服务器，上传程序，"
+            "由远程守护进程准备环境、安装依赖并运行任务。"
         ),
         epilog=(
             "示例：\n"
@@ -111,7 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
             "\n"
             "注意：\n"
             "  --maxusetime 只计算用户程序真正运行的时间，\n"
-            "  不包含创建服务器、等待 SSH 和安装依赖的时间。"
+            "  不包含创建服务器、等待 SSH、创建虚拟环境\n"
+            "  和安装依赖的时间。"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -120,7 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
         "python_file",
         type=Path,
         metavar="PYTHON_FILE",
-        help="需要上传并执行的 Python 文件，目前仅支持单个 .py 文件。",
+        help=(
+            "需要上传并执行的 Python 文件，"
+            "目前仅支持单个 .py 文件。"
+        ),
     )
 
     environment_group = (
@@ -133,7 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         default="tencentcloud",
         choices=["tencentcloud"],
-        help="云服务提供商，当前仅支持腾讯云（默认：tencentcloud）。",
+        help=(
+            "云服务提供商，当前仅支持腾讯云"
+            "（默认：tencentcloud）。"
+        ),
     )
 
     environment_group.add_argument(
@@ -188,7 +206,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         metavar="COUNT",
-        help="每个地域最多保留的候选机型数量（默认：10）。",
+        help=(
+            "每个地域最多保留的候选机型数量"
+            "（默认：10）。"
+        ),
     )
 
     task_group = run_parser.add_argument_group(
@@ -213,7 +234,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="FILES",
         help=(
-            "任务结束后下载的文件，多个文件使用逗号分隔。"
+            "任务结束后下载的文件，"
+            "多个文件使用逗号分隔。"
             "例如 --return result.xlsx,output.txt。"
         ),
     )
@@ -224,6 +246,29 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "任务结束后保留云服务器。"
             "启用后服务器可能继续产生费用。"
+        ),
+    )
+
+    attach_parser = subparsers.add_parser(
+        "attach",
+        help="重新连接已经启动的远程任务。",
+        description=(
+            "根据实例 ID 读取本地任务记录，"
+            "重新连接云服务器并继续显示远程任务日志。"
+        ),
+        epilog=(
+            "示例：\n"
+            "  suanqi attach ins-xxxxxxxx"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    attach_parser.add_argument(
+        "instance_id",
+        metavar="INSTANCE_ID",
+        help=(
+            "需要重新连接的实例 ID，"
+            "例如 ins-ayx5jszt。"
         ),
     )
 
@@ -245,7 +290,10 @@ def build_parser() -> argparse.ArgumentParser:
     release_parser.add_argument(
         "instance_id",
         metavar="INSTANCE_ID",
-        help="需要释放的腾讯云实例 ID，例如 ins-xxxxxxxx。",
+        help=(
+            "需要释放的腾讯云实例 ID，"
+            "例如 ins-xxxxxxxx。"
+        ),
     )
 
     release_parser.add_argument(
@@ -255,6 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
 
 def _validate_run_arguments(
     parser: argparse.ArgumentParser,
@@ -302,14 +351,15 @@ def _validate_run_arguments(
 
         if not requirements_file.is_file():
             parser.error(
-                f"requirements 文件不存在："
+                "requirements 文件不存在："
                 f"{requirements_file}"
             )
 
-        arguments.requirements = requirements_file
+        arguments.requirements = (
+            requirements_file
+        )
 
     try:
-        # 根据 CPU 和内存联动规则，计算最终最低资源要求
         minimum_cpu, minimum_memory_gb = (
             resolve_resource_requirements(
                 cpu=arguments.cpu,
@@ -317,27 +367,32 @@ def _validate_run_arguments(
             )
         )
     except ValueError as error:
-        parser.error(str(error))
+        parser.error(
+            str(error)
+        )
 
     try:
-        # 将 5h、1h30m 等格式转换为秒数
         max_use_seconds = parse_duration(
             arguments.maxusetime
         )
     except ValueError as error:
-        parser.error(str(error))
+        parser.error(
+            str(error)
+        )
 
     if arguments.maximum_region_instances <= 0:
         parser.error(
             "--maximum-region-instances 必须大于 0"
         )
 
-    # 将联动计算后的最终值写回 arguments
     arguments.cpu = minimum_cpu
-    arguments.memory = minimum_memory_gb
+    # arguments.cpu 是最终最低 CPU 核心数
 
-    # 新增最大运行秒数字段
+    arguments.memory = minimum_memory_gb
+    # arguments.memory 是最终最低内存，单位 GB
+
     arguments.max_use_seconds = max_use_seconds
+    # arguments.max_use_seconds 是最大运行秒数
 
 
 def list_instances_command() -> int:
@@ -345,7 +400,9 @@ def list_instances_command() -> int:
 
     gateway = TencentCloudGateway()
 
-    print("正在查询 SuanQi 管理的腾讯云实例……")
+    print(
+        "正在查询 SuanQi 管理的腾讯云实例……"
+    )
 
     result = list_suanqi_instances(
         gateway=gateway,
@@ -364,7 +421,9 @@ def list_instances_command() -> int:
     )
 
     print()
-    print(format_instance_table(instances))
+    print(
+        format_instance_table(instances)
+    )
     print(
         f"\n共找到 {len(instances)} 台 "
         "SuanQi 管理的实例。"
@@ -376,7 +435,9 @@ def list_instances_command() -> int:
     )
 
     if failed_regions:
-        print("\n以下地域查询失败：")
+        print(
+            "\n以下地域查询失败："
+        )
 
         for item in failed_regions:
             print(
@@ -428,14 +489,30 @@ def release_instance_command(
         )
         return 1
 
-    print("\n即将强制释放实例：")
-    print(f"实例 ID：{selected.instance_id}")
-    print(f"实例名称：{selected.instance_name}")
-    print(f"状态：{selected.state}")
-    print(f"地域：{selected.region}")
-    print(f"可用区：{selected.zone or '-'}")
-    print(f"公网 IP：{selected.public_ip or '-'}")
-    print(f"创建时间：{selected.created_time or '-'}")
+    print(
+        "\n即将强制释放实例："
+    )
+    print(
+        f"实例 ID：{selected.instance_id}"
+    )
+    print(
+        f"实例名称：{selected.instance_name}"
+    )
+    print(
+        f"状态：{selected.state}"
+    )
+    print(
+        f"地域：{selected.region}"
+    )
+    print(
+        f"可用区：{selected.zone or '-'}"
+    )
+    print(
+        f"公网 IP：{selected.public_ip or '-'}"
+    )
+    print(
+        f"创建时间：{selected.created_time or '-'}"
+    )
     print(
         "\n警告：实例上的未上传日志和结果"
         "可能永久丢失。"
@@ -447,7 +524,9 @@ def release_instance_command(
         ).strip()
 
         if confirmation != "RELEASE":
-            print("已取消释放实例。")
+            print(
+                "已取消释放实例。"
+            )
             return 1
 
     result = release_suanqi_instance(
@@ -467,7 +546,205 @@ def release_instance_command(
     print(
         f"实例释放请求已提交：{instance_id}"
     )
+
     return 0
+
+
+def attach_command(
+    instance_id: str,
+) -> int:
+    """根据实例 ID 重新连接远程任务。"""
+
+    try:
+        record = load_task_record(
+            instance_id
+        )
+
+    except (
+        FileNotFoundError,
+        ValueError,
+    ) as error:
+        print(
+            f"读取任务记录失败：{error}"
+        )
+        return 1
+
+    provider = record.get(
+        "provider"
+    )
+
+    if provider != "tencentcloud":
+        print(
+            "当前 attach 只支持腾讯云任务。"
+        )
+        return 1
+
+    record_instance_id = str(
+        record.get("instance_id") or ""
+    )
+
+    if record_instance_id != instance_id:
+        print(
+            "本地任务记录中的实例 ID 不一致："
+            f"{record_instance_id}"
+        )
+        return 1
+
+    required_fields = [
+        "task_id",
+        "region",
+        "instance_id",
+        "public_ip",
+        "ssh_username",
+        "ssh_port",
+        "instance_password",
+        "service_name",
+        "task_root",
+        "user_directory",
+        "control_directory",
+        "status_path",
+        "task_log_path",
+        "worker_log_path",
+        "manifest_path",
+    ]
+
+    missing_fields = [
+        field_name
+        for field_name in required_fields
+        if record.get(field_name) in (
+            None,
+            "",
+        )
+    ]
+
+    if missing_fields:
+        print(
+            "任务记录缺少必要字段："
+            + ", ".join(missing_fields)
+        )
+        return 1
+
+    server = ServerInfo(
+        provider="tencentcloud",
+        region=str(
+            record["region"]
+        ),
+        instance_id=str(
+            record["instance_id"]
+        ),
+        public_ip=str(
+            record["public_ip"]
+        ),
+        ssh_username=str(
+            record["ssh_username"]
+        ),
+        ssh_port=int(
+            record["ssh_port"]
+        ),
+        instance_password=str(
+            record["instance_password"]
+        ),
+    )
+
+    worker_task = WorkerTask(
+        task_id=str(
+            record["task_id"]
+        ),
+        service_name=str(
+            record["service_name"]
+        ),
+        task_root=str(
+            record["task_root"]
+        ),
+        user_directory=str(
+            record["user_directory"]
+        ),
+        control_directory=str(
+            record["control_directory"]
+        ),
+        status_path=str(
+            record["status_path"]
+        ),
+        task_log_path=str(
+            record["task_log_path"]
+        ),
+        worker_log_path=str(
+            record["worker_log_path"]
+        ),
+        manifest_path=str(
+            record["manifest_path"]
+        ),
+    )
+
+    print(
+        "正在连接服务器："
+        f"{server.public_ip}"
+    )
+
+    try:
+        wait_for_ssh(
+            server
+        )
+
+        final_status = attach_worker_task(
+            server=server,
+            worker_task=worker_task,
+        )
+
+    except KeyboardInterrupt:
+        print(
+            "\n已停止本地日志跟踪。"
+        )
+        print(
+            "远程任务不会因此停止。"
+        )
+        print(
+            f"重新连接：suanqi attach {instance_id}"
+        )
+        return 0
+
+    except Exception as error:
+        print(
+            "重新连接任务失败："
+            f"{error.__class__.__name__}："
+            f"{error}"
+        )
+        return 1
+
+    status_name = (
+        final_status.get("status")
+        or final_status.get("state")
+        or "UNKNOWN"
+    )
+
+    update_task_record(
+        instance_id,
+        status=status_name,
+        exit_code=final_status.get(
+            "exit_code"
+        ),
+        updated_at=final_status.get(
+            "updated_at"
+        ),
+    )
+
+    print(
+        "\n任务已经结束："
+        f"{status_name}"
+    )
+
+    exit_code = final_status.get(
+        "exit_code"
+    )
+
+    return (
+        0
+        if (
+            status_name == "SUCCESS"
+            and exit_code == 0
+        )
+        else 1
+    )
 
 
 def run_command(
@@ -481,10 +758,18 @@ def run_command(
         arguments,
     )
 
-    print("\n任务参数：")
-    print(f"Python 文件：{arguments.python_file}")
-    print(f"最低 CPU：{arguments.cpu} 核")
-    print(f"最低内存：{arguments.memory} GB")
+    print(
+        "\n任务参数："
+    )
+    print(
+        f"Python 文件：{arguments.python_file}"
+    )
+    print(
+        f"最低 CPU：{arguments.cpu} 核"
+    )
+    print(
+        f"最低内存：{arguments.memory} GB"
+    )
     print(
         "最大运行时间："
         f"{arguments.maxusetime} "
@@ -493,7 +778,9 @@ def run_command(
 
     result = tencentcloud_run(
         python_file=arguments.python_file,
-        requirements_file=arguments.requirements,
+        requirements_file=(
+            arguments.requirements
+        ),
         packages=arguments.install,
         return_files=arguments.return_files,
         minimum_cpu=arguments.cpu,
@@ -502,28 +789,56 @@ def run_command(
             arguments.maximum_region_instances
         ),
         keep_instance=arguments.keep,
-
-        # 用户程序最大运行时间，单位秒
-        max_use_seconds=arguments.max_use_seconds,
+        max_use_seconds=(
+            arguments.max_use_seconds
+        ),
     )
 
     if not result:
         return 1
 
-    if not result.get("success"):
+    if result.get("detached"):
         print(
-            "\n任务执行失败："
+            "\n已断开本地日志跟踪。"
+        )
+        print(
+            "远程任务仍在运行。"
+        )
+        print(
+            "重新连接："
+            f"suanqi attach "
+            f"{result.get('instance_id')}"
+        )
+        return 0
+
+    task_success = bool(
+        result.get("success")
+    )
+    # task_success 表示远程任务是否成功完成
+
+    if not task_success:
+        print(
+            "\n任务未成功完成："
             f"{result.get('error_message') or '未知错误'}"
         )
-        return 1
 
-    print("\n任务执行完成：")
-    print(f"任务 ID：{result.get('task_id')}")
-    print(f"实例 ID：{result.get('instance_id')}")
+    print(
+        "\n任务执行结束："
+    )
+    print(
+        f"任务 ID：{result.get('task_id')}"
+    )
+    print(
+        f"实例 ID：{result.get('instance_id')}"
+    )
     print(
         "配置："
         f"{result.get('cpu')} 核 / "
         f"{result.get('memory_gb')} GB"
+    )
+    print(
+        "任务状态："
+        f"{result.get('state') or 'UNKNOWN'}"
     )
     print(
         f"程序退出码：{result.get('exit_code')}"
@@ -533,13 +848,16 @@ def run_command(
         result.get("downloaded_files")
         or []
     )
+
     missing_files = (
         result.get("missing_files")
         or []
     )
 
     if downloaded_files:
-        print("\n已下载文件：")
+        print(
+            "\n已下载文件："
+        )
 
         for item in downloaded_files:
             print(
@@ -548,19 +866,24 @@ def run_command(
             )
 
     if missing_files:
-        print("\n未找到的返回文件：")
+        print(
+            "\n未找到的返回文件："
+        )
 
         for item in missing_files:
-            print(f"- {item}")
+            print(
+                f"- {item}"
+            )
 
     if result.get("instance_kept"):
         print(
-            "\n服务器已保留，按量计费仍可能继续。"
+            "\n服务器已保留，"
+            "按量计费仍可能继续。"
         )
 
     return (
         0
-        if result.get("exit_code") == 0
+        if task_success
         else 1
     )
 
@@ -576,6 +899,11 @@ def main() -> int:
         return run_command(
             parser,
             arguments,
+        )
+
+    if arguments.command == "attach":
+        return attach_command(
+            instance_id=arguments.instance_id,
         )
 
     if arguments.command == "release":

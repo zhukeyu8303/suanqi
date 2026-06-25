@@ -67,7 +67,6 @@ class PreparedTask:
 
 @dataclass(slots=True)
 class WorkerTask:
-    """已经启动守护进程的任务。"""
 
     task_id: str
     service_name: str
@@ -76,6 +75,7 @@ class WorkerTask:
     control_directory: str
     status_path: str
     task_log_path: str
+    worker_log_path: str
     manifest_path: str
 
 
@@ -733,6 +733,173 @@ def write_remote_root_file(
             check=False,
         )
 
+def attach_worker_task(
+    server: ServerInfo,
+    worker_task: WorkerTask,
+) -> dict[str, Any]:
+    """
+    重新连接已经启动的任务并继续显示日志。
+
+    从日志开头重新显示。
+    """
+
+    task_log_offset = 0
+    # task_log_offset 是 task.log 已读取到的字节位置
+
+    worker_log_offset = 0
+    # worker_log_offset 是 worker.log 已读取到的字节位置
+
+    terminal_statuses = {
+        "SUCCESS",
+        "FAILED",
+        "TIMEOUT",
+        "WORKER_FAILED",
+    }
+
+    last_status_name: str | None = None
+
+    print(
+        f"正在连接任务：{worker_task.task_id}"
+    )
+
+    while True:
+        try:
+            worker_data, worker_log_offset = (
+                read_root_log_chunk(
+                    server=server,
+                    remote_path=(
+                        worker_task.worker_log_path
+                    ),
+                    offset=worker_log_offset,
+                )
+            )
+
+            if worker_data:
+                print(
+                    worker_data.decode(
+                        "utf-8",
+                        errors="replace",
+                    ),
+                    end="",
+                    flush=True,
+                )
+
+            task_data, task_log_offset = (
+                read_root_log_chunk(
+                    server=server,
+                    remote_path=(
+                        worker_task.task_log_path
+                    ),
+                    offset=task_log_offset,
+                )
+            )
+
+            if task_data:
+                print(
+                    task_data.decode(
+                        "utf-8",
+                        errors="replace",
+                    ),
+                    end="",
+                    flush=True,
+                )
+
+            status_data = read_root_json_file(
+                server=server,
+                remote_path=(
+                    worker_task.status_path
+                ),
+            )
+
+            if status_data is not None:
+                status_name = (
+                    status_data.get("status")
+                    or status_data.get("state")
+                )
+
+                if (
+                    status_name
+                    and status_name
+                    != last_status_name
+                ):
+                    last_status_name = status_name
+
+                    print(
+                        "\n[SuanQi] 当前状态："
+                        f"{status_name}"
+                    )
+
+                if status_name in terminal_statuses:
+                    # 状态先写入、日志后写入时，
+                    # 再读取一次，避免漏掉最后几行
+                    worker_data, worker_log_offset = (
+                        read_root_log_chunk(
+                            server=server,
+                            remote_path=(
+                                worker_task.worker_log_path
+                            ),
+                            offset=worker_log_offset,
+                        )
+                    )
+
+                    if worker_data:
+                        print(
+                            worker_data.decode(
+                                "utf-8",
+                                errors="replace",
+                            ),
+                            end="",
+                            flush=True,
+                        )
+
+                    task_data, task_log_offset = (
+                        read_root_log_chunk(
+                            server=server,
+                            remote_path=(
+                                worker_task.task_log_path
+                            ),
+                            offset=task_log_offset,
+                        )
+                    )
+
+                    if task_data:
+                        print(
+                            task_data.decode(
+                                "utf-8",
+                                errors="replace",
+                            ),
+                            end="",
+                            flush=True,
+                        )
+
+                    return status_data
+
+        except (
+            paramiko.SSHException,
+            socket.timeout,
+            ConnectionRefusedError,
+            OSError,
+        ) as error:
+            print(
+                "\n[SuanQi] SSH 连接中断："
+                f"{error}"
+            )
+            print(
+                "[SuanQi] 正在重新连接……"
+            )
+
+            wait_for_ssh(
+                server
+            )
+
+            print(
+                "[SuanQi] 已重新连接，"
+                "继续输出日志。"
+            )
+
+        time.sleep(1)
+
+
 
 def start_worker_task(
     server: ServerInfo,
@@ -918,14 +1085,15 @@ WantedBy=multi-user.target
         service_name=service_name,
         task_root=task.task_root,
         user_directory=task.user_directory,
-        control_directory=(
-            task.control_directory
-        ),
+        control_directory=task.control_directory,
         status_path=(
             f"{task.control_directory}/status.json"
         ),
         task_log_path=(
             f"{task.control_directory}/task.log"
+        ),
+        worker_log_path=(
+            f"{task.control_directory}/worker.log"
         ),
         manifest_path=(
             f"{task.control_directory}/manifest.json"
@@ -1014,10 +1182,11 @@ def follow_worker_task(
     server: ServerInfo,
     worker_task: WorkerTask,
 ) -> dict[str, Any]:
-    """实时读取任务日志直到结束。"""
+    """实时读取任务日志，SSH 断开后自动重连。"""
 
     offset = 0
-    # offset 代表已经读取到的日志字节位置
+    # offset 代表已经读取到 task.log 的字节位置
+    # SSH 重连后不会清零，所以不会重复输出旧日志
 
     terminal_statuses = {
         "SUCCESS",
@@ -1025,12 +1194,6 @@ def follow_worker_task(
         "TIMEOUT",
         "WORKER_FAILED",
     }
-    # terminal_statuses 是所有最终状态
-    # 遇到其中一个状态后停止轮询
-
-    last_status_name: str | None = None
-    # last_status_name 保存上一次读取到的状态
-    # 用于避免重复输出状态变化
 
     while True:
         try:
@@ -1060,73 +1223,8 @@ def follow_worker_task(
                     status.get("status")
                     or status.get("state")
                 )
-                # 目前 worker 使用 status 字段
-                # 同时兼容未来可能使用的 state 字段
-
-                if (
-                    status_name
-                    and status_name
-                    != last_status_name
-                ):
-                    last_status_name = status_name
-
-                    if status_name == "STARTING":
-                        print(
-                            "\n远程任务正在启动……"
-                        )
-
-                    elif status_name == "RUNNING":
-                        print(
-                            "\n远程任务正在运行……"
-                        )
-
-                    elif status_name == "TIMEOUT":
-                        print(
-                            "\n任务达到最大运行时间，"
-                            "远程程序已停止。"
-                        )
-
-                    elif status_name == "SUCCESS":
-                        print(
-                            "\n远程任务运行成功。"
-                        )
-
-                    elif status_name == "FAILED":
-                        print(
-                            "\n远程任务运行失败。"
-                        )
-
-                    elif status_name == "WORKER_FAILED":
-                        print(
-                            "\n远程守护进程运行失败。"
-                        )
-
-                    elif status_name == "PREPARING":
-                        print(
-                            "\n远程任务正在准备 Python 环境……"
-                        )
 
                 if status_name in terminal_statuses:
-                    # 最后再读一次日志
-                    # 避免状态文件先更新，最后几行日志未显示
-                    final_data, offset = (
-                        read_root_log_chunk(
-                            server,
-                            worker_task.task_log_path,
-                            offset,
-                        )
-                    )
-
-                    if final_data:
-                        print(
-                            final_data.decode(
-                                "utf-8",
-                                errors="replace",
-                            ),
-                            end="",
-                            flush=True,
-                        )
-
                     return status
 
         except (
@@ -1134,13 +1232,26 @@ def follow_worker_task(
             socket.timeout,
             ConnectionRefusedError,
             OSError,
-        ):
+        ) as error:
             print(
-                "\nSSH 连接中断，远程任务仍在运行，"
-                "正在重新连接……"
+                "\n[SuanQi] SSH 连接中断，"
+                "远程任务仍在运行。"
+            )
+
+            print(
+                f"[SuanQi] 断开原因：{error}"
+            )
+
+            print(
+                "[SuanQi] 正在重新连接……"
             )
 
             wait_for_ssh(server)
+
+            print(
+                "[SuanQi] 已重新连接，"
+                "继续输出日志。"
+            )
 
         time.sleep(1)
 

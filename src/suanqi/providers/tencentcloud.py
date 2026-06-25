@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,10 @@ from suanqi.remote import (
     prepare_python_task,
     start_worker_task,
     wait_for_ssh,
+)
+from suanqi.task_store import (
+    save_task_record,
+    update_task_record,
 )
 
 from .server_initializer import (
@@ -63,7 +68,6 @@ def tencentcloud_run(
 
         max_use_seconds：
             用户程序最大允许运行时间，单位秒。
-            默认值为 18000 秒，也就是 5 小时。
     """
 
     if max_use_seconds <= 0:
@@ -74,26 +78,35 @@ def tencentcloud_run(
     gateway = TencentCloudGateway()
 
     server = None
-    # server 保存已经创建的腾讯云服务器信息
+    # server 保存腾讯云服务器信息
 
     task = None
-    # task 保存远程任务信息，例如 task_id 和任务目录
+    # task 保存远程任务目录与内部任务 ID
 
-    exit_code = None
-    # exit_code 保存用户程序退出码
+    worker_task = None
+    # worker_task 保存远程守护进程路径
 
-    final_state = None
-    # final_state 保存任务最终状态
-    # 例如 SUCCESS、FAILED、TIMEOUT、WORKER_FAILED
+    worker_started = False
+    # worker_started 表示 systemd 守护进程是否已经启动
+
+    detached = False
+    # detached 表示用户是否仅断开客户端日志跟踪
+
+    exit_code: int | None = None
+    # exit_code 是用户程序退出码
+
+    final_state: str | None = None
+    # final_state 是最终状态
+    # SUCCESS、FAILED、TIMEOUT 或 WORKER_FAILED
 
     downloaded_files: list[dict[str, Any]] = []
-    # downloaded_files 保存已经成功下载的返回文件
+    # downloaded_files 保存成功下载的文件
 
     missing_files: list[str] = []
-    # missing_files 保存服务器上没有找到的返回文件
+    # missing_files 保存未找到的返回文件
 
     error_message: str | None = None
-    # error_message 保存任务运行过程中的错误信息
+    # error_message 保存失败原因
 
     try:
         create_result = tencentcloud_creat(
@@ -107,6 +120,7 @@ def tencentcloud_run(
         if not create_result:
             return {
                 "success": False,
+                "detached": False,
                 "error_message": "未创建实例",
                 "provider": "tencentcloud",
                 "region": None,
@@ -127,16 +141,28 @@ def tencentcloud_run(
             create_result
         )
 
-        print("\n正在等待 SSH 服务启动……")
-        wait_for_ssh(server)
+        print(
+            "\n正在等待 SSH 服务启动……"
+        )
 
-        print("正在初始化服务器……")
-        initialize_server(server)
+        wait_for_ssh(
+            server
+        )
+
+        print(
+            "正在初始化服务器……"
+        )
+
+        initialize_server(
+            server
+        )
 
         task = prepare_python_task(
             server=server,
             python_file=python_file,
-            requirements_file=requirements_file,
+            requirements_file=(
+                requirements_file
+            ),
         )
 
         worker_file = (
@@ -147,20 +173,122 @@ def tencentcloud_run(
         worker_task = start_worker_task(
             server=server,
             task=task,
-            return_files=return_files or [],
-            local_worker_path=worker_file,
-
-            # 将 -i 指定的依赖交给远程 worker
-            packages=packages or [],
-
-            # main.py 的最大运行时间
-            max_use_seconds=max_use_seconds,
-
-            # main.py 超时后的优雅退出等待时间
+            return_files=(
+                return_files or []
+            ),
+            local_worker_path=(
+                worker_file
+            ),
+            packages=(
+                packages or []
+            ),
+            max_use_seconds=(
+                max_use_seconds
+            ),
             terminate_grace_seconds=30,
+            preparation_timeout_seconds=(
+                2 * 60 * 60
+            ),
+        )
 
-            # 创建虚拟环境和安装依赖最多允许2小时
-            preparation_timeout_seconds=2 * 60 * 60,
+        worker_started = True
+
+        task_record_path = save_task_record(
+            server.instance_id,
+            {
+                "instance_id": (
+                    server.instance_id
+                ),
+
+                "task_id": (
+                    task.task_id
+                ),
+
+                "provider": (
+                    "tencentcloud"
+                ),
+
+                "region": (
+                    server.region
+                ),
+
+                "public_ip": (
+                    server.public_ip
+                ),
+
+                "ssh_username": (
+                    server.ssh_username
+                ),
+
+                "ssh_port": (
+                    server.ssh_port
+                ),
+
+                "instance_password": (
+                    server.instance_password
+                ),
+
+                "service_name": (
+                    worker_task.service_name
+                ),
+
+                "task_root": (
+                    worker_task.task_root
+                ),
+
+                "user_directory": (
+                    worker_task.user_directory
+                ),
+
+                "control_directory": (
+                    worker_task.control_directory
+                ),
+
+                "status_path": (
+                    worker_task.status_path
+                ),
+
+                "task_log_path": (
+                    worker_task.task_log_path
+                ),
+
+                "worker_log_path": (
+                    worker_task.worker_log_path
+                ),
+
+                "manifest_path": (
+                    worker_task.manifest_path
+                ),
+
+                "return_files": (
+                    return_files or []
+                ),
+
+                "max_use_seconds": (
+                    max_use_seconds
+                ),
+
+                "status": (
+                    "STARTING"
+                ),
+
+                "created_at": (
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                ),
+            },
+        )
+
+        print(
+            "\n本地实例记录已保存："
+            f"{task_record_path}"
+        )
+
+        print(
+            "重新连接命令："
+            f"suanqi attach "
+            f"{server.instance_id}"
         )
 
         print(
@@ -178,96 +306,348 @@ def tencentcloud_run(
             worker_task,
         )
 
-        final_state = final_status.get(
-            "state"
-        )
-        # state 是 worker 写入的最终任务状态
+        if not isinstance(
+            final_status,
+            dict,
+        ):
+            raise RuntimeError(
+                "远程守护进程返回了无效状态数据"
+            )
 
-        exit_code = final_status.get(
+        final_state = (
+            final_status.get("status")
+            or final_status.get("state")
+        )
+        # worker.py 当前使用 status 字段
+        # 同时兼容旧版 state 字段
+
+        if final_state is not None:
+            final_state = str(
+                final_state
+            ).strip().upper()
+
+        exit_code_value = final_status.get(
             "exit_code"
         )
 
-        if exit_code is None:
-            # worker 没有返回退出码时，使用 1 表示失败
+        if exit_code_value is not None:
+            try:
+                exit_code = int(
+                    exit_code_value
+                )
+            except (
+                TypeError,
+                ValueError,
+            ) as error:
+                raise RuntimeError(
+                    "远程任务返回了无效退出码："
+                    f"{exit_code_value!r}"
+                ) from error
+
+        elif final_state == "SUCCESS":
+            # 成功状态没有退出码时，兼容性处理为0
+            exit_code = 0
+
+        else:
+            # 其他状态没有退出码时，统一视为失败
             exit_code = 1
 
         if return_files:
-            downloaded_files, missing_files = (
-                download_return_files(
-                    server,
-                    task,
-                    return_files,
-                )
+            (
+                downloaded_files,
+                missing_files,
+            ) = download_return_files(
+                server,
+                task,
+                return_files,
             )
 
-        if final_state == "TIMEOUT":
+        if final_state == "SUCCESS":
+            if exit_code != 0:
+                error_message = (
+                    "远程状态为 SUCCESS，"
+                    f"但程序退出码为 {exit_code}"
+                )
+
+        elif final_state == "TIMEOUT":
             error_message = (
-                "远程程序超过最大运行时间，"
-                "已由守护进程停止"
+                final_status.get(
+                    "message"
+                )
+                or (
+                    "远程程序超过最大运行时间，"
+                    "已由守护进程停止"
+                )
             )
 
         elif final_state == "WORKER_FAILED":
             error_message = (
-                final_status.get("message")
+                final_status.get(
+                    "error_message"
+                )
+                or final_status.get(
+                    "message"
+                )
                 or "远程守护进程运行失败"
             )
 
-        elif exit_code != 0:
+        elif final_state == "FAILED":
             error_message = (
-                f"远程程序退出码为 {exit_code}"
+                final_status.get(
+                    "message"
+                )
+                or (
+                    "远程程序运行失败，"
+                    f"退出码为 {exit_code}"
+                )
+            )
+
+        elif final_state is None:
+            error_message = (
+                "远程状态文件中缺少 "
+                "status 或 state 字段"
+            )
+
+        else:
+            error_message = (
+                "无法识别远程任务状态："
+                f"{final_state}"
             )
 
         task_success = (
             final_state == "SUCCESS"
             and exit_code == 0
         )
-        # 只有状态是 SUCCESS 且退出码为 0，
-        # 才认为整个远程任务执行成功
+
+        try:
+            update_task_record(
+                server.instance_id,
+                status=(
+                    final_state
+                    or "UNKNOWN"
+                ),
+                exit_code=(
+                    exit_code
+                ),
+                error_message=(
+                    None
+                    if task_success
+                    else error_message
+                ),
+                updated_at=(
+                    final_status.get(
+                        "updated_at"
+                    )
+                    or datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                ),
+            )
+
+        except Exception as record_error:
+            print(
+                "\n警告：更新本地实例记录失败："
+                f"{record_error}"
+            )
 
         return {
-            "success": task_success,
+            "success": (
+                task_success
+            ),
+
+            "detached": False,
+
             "error_message": (
                 None
                 if task_success
-                else error_message
+                else (
+                    error_message
+                    or "远程任务执行失败"
+                )
             ),
-            "provider": "tencentcloud",
-            "region": server.region,
-            "instance_id": server.instance_id,
-            "public_ip": server.public_ip,
-            "cpu": server.cpu,
-            "memory_gb": server.memory_gb,
-            "task_id": task.task_id,
-            "state": final_state,
-            "exit_code": exit_code,
-            "max_use_seconds": max_use_seconds,
-            "downloaded_files": downloaded_files,
-            "missing_files": missing_files,
-            "instance_kept": keep_instance,
+
+            "provider": (
+                "tencentcloud"
+            ),
+
+            "region": (
+                server.region
+            ),
+
+            "instance_id": (
+                server.instance_id
+            ),
+
+            "public_ip": (
+                server.public_ip
+            ),
+
+            "cpu": (
+                server.cpu
+            ),
+
+            "memory_gb": (
+                server.memory_gb
+            ),
+
+            "task_id": (
+                task.task_id
+            ),
+
+            "state": (
+                final_state
+            ),
+
+            "exit_code": (
+                exit_code
+            ),
+
+            "max_use_seconds": (
+                max_use_seconds
+            ),
+
+            "downloaded_files": (
+                downloaded_files
+            ),
+
+            "missing_files": (
+                missing_files
+            ),
+
+            "instance_kept": (
+                keep_instance
+            ),
         }
 
     except KeyboardInterrupt:
-        error_message = "用户中断了任务"
+        if (
+            worker_started
+            and server is not None
+            and task is not None
+        ):
+            detached = True
+
+            try:
+                update_task_record(
+                    server.instance_id,
+                    status="DETACHED",
+                    detached_at=(
+                        datetime.now(
+                            timezone.utc
+                        ).isoformat()
+                    ),
+                )
+
+            except Exception as record_error:
+                print(
+                    "\n警告：更新本地实例记录失败："
+                    f"{record_error}"
+                )
+
+            print(
+                "\n已停止本地日志跟踪。"
+            )
+
+            print(
+                "远程任务仍在运行。"
+            )
+
+            print(
+                "重新连接命令："
+                f"suanqi attach "
+                f"{server.instance_id}"
+            )
+
+            return {
+                "success": True,
+                "detached": True,
+                "error_message": None,
+                "provider": "tencentcloud",
+
+                "region": (
+                    server.region
+                ),
+
+                "instance_id": (
+                    server.instance_id
+                ),
+
+                "public_ip": (
+                    server.public_ip
+                ),
+
+                "cpu": (
+                    server.cpu
+                ),
+
+                "memory_gb": (
+                    server.memory_gb
+                ),
+
+                "task_id": (
+                    task.task_id
+                ),
+
+                "state": (
+                    "DETACHED"
+                ),
+
+                "exit_code": None,
+
+                "max_use_seconds": (
+                    max_use_seconds
+                ),
+
+                "downloaded_files": [],
+
+                "missing_files": [],
+
+                "instance_kept": True,
+            }
+
+        error_message = (
+            "用户在远程守护进程启动前中断了操作"
+        )
+
+        print(
+            f"\n{error_message}"
+        )
 
     except Exception as error:
         error_message = (
-            f"{error.__class__.__name__}：{error}"
+            f"{error.__class__.__name__}："
+            f"{error}"
+        )
+
+        print(
+            "\n任务运行过程发生异常："
+            f"{error_message}"
         )
 
     finally:
-        if (
+        should_release_instance = (
             server is not None
             and not keep_instance
-        ):
-            print("\n正在释放实例……")
+            and not detached
+        )
 
-            release_result = gateway.terminate_instances(
-                server.region,
-                [server.instance_id],
+        if should_release_instance:
+            print(
+                "\n正在释放实例……"
+            )
+
+            release_result = (
+                gateway.terminate_instances(
+                    server.region,
+                    [server.instance_id],
+                )
             )
 
             if release_result.success:
-                print("实例释放请求已提交")
+                print(
+                    "实例释放请求已提交"
+                )
+
             else:
                 print(
                     "实例释放失败："
@@ -286,46 +666,74 @@ def tencentcloud_run(
 
     return {
         "success": False,
+
+        "detached": False,
+
         "error_message": (
             error_message
-            or "任务执行失败"
+            or "任务执行失败，但没有获得具体错误信息"
         ),
-        "provider": "tencentcloud",
+
+        "provider": (
+            "tencentcloud"
+        ),
+
         "region": (
             server.region
             if server is not None
             else None
         ),
+
         "instance_id": (
             server.instance_id
             if server is not None
             else None
         ),
+
         "public_ip": (
             server.public_ip
             if server is not None
             else None
         ),
+
         "cpu": (
             server.cpu
             if server is not None
             else None
         ),
+
         "memory_gb": (
             server.memory_gb
             if server is not None
             else None
         ),
+
         "task_id": (
             task.task_id
             if task is not None
             else None
         ),
-        "state": final_state,
-        "exit_code": exit_code,
-        "max_use_seconds": max_use_seconds,
-        "downloaded_files": downloaded_files,
-        "missing_files": missing_files,
+
+        "state": (
+            final_state
+        ),
+
+        "exit_code": (
+            exit_code
+        ),
+
+        "max_use_seconds": (
+            max_use_seconds
+        ),
+
+        "downloaded_files": (
+            downloaded_files
+        ),
+
+        "missing_files": (
+            missing_files
+        ),
+
         "instance_kept": (
             keep_instance
             and server is not None

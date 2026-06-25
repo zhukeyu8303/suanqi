@@ -18,10 +18,19 @@ DEFAULT_MAX_USE_SECONDS = 5 * 60 * 60
 DEFAULT_TERMINATE_GRACE_SECONDS = 30
 # 发送 SIGTERM 后等待程序自行退出的时间：30秒
 
-DEFAULT_PREPARATION_TIMEOUT_SECONDS = (
-    0.5 * 60 * 60
+DEFAULT_PREPARATION_TIMEOUT_SECONDS = 30 * 60
+# 创建虚拟环境和安装依赖默认最多允许30分钟
+
+DEFAULT_PIP_INDEX_URL = (
+    "https://mirrors.cloud.tencent.com/pypi/simple"
 )
-# 创建虚拟环境和安装依赖默认最多允许0.5小时
+# 腾讯云 PyPI 镜像地址
+
+DEFAULT_PIP_NETWORK_TIMEOUT_SECONDS = 120
+# pip 单次连接或读取网络数据的超时时间：120秒
+
+DEFAULT_PIP_RETRY_COUNT = 5
+# pip 下载失败后的重试次数
 
 
 def utc_now() -> str:
@@ -43,33 +52,48 @@ def atomic_write_json(
         exist_ok=True,
     )
 
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=file_path.parent,
-        delete=False,
-    ) as temporary_file:
-        json.dump(
-            data,
-            temporary_file,
-            ensure_ascii=False,
-            indent=2,
+    temporary_name: str | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=file_path.parent,
+            delete=False,
+        ) as temporary_file:
+            json.dump(
+                data,
+                temporary_file,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+            temporary_file.flush()
+
+            os.fsync(
+                temporary_file.fileno()
+            )
+
+            temporary_name = (
+                temporary_file.name
+            )
+
+        os.replace(
+            temporary_name,
+            file_path,
         )
 
-        # 将 Python 缓冲区中的内容写入操作系统
-        temporary_file.flush()
-
-        # 尽量确保数据已经写入磁盘
-        os.fsync(
-            temporary_file.fileno()
-        )
-
-        temporary_name = temporary_file.name
-
-    os.replace(
-        temporary_name,
-        file_path,
-    )
+    finally:
+        if (
+            temporary_name is not None
+            and os.path.exists(temporary_name)
+        ):
+            try:
+                os.unlink(
+                    temporary_name
+                )
+            except OSError:
+                pass
 
 
 def load_task_config(
@@ -81,7 +105,14 @@ def load_task_config(
         "r",
         encoding="utf-8",
     ) as file:
-        return json.load(file)
+        data = json.load(file)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "任务配置必须是 JSON 对象"
+        )
+
+    return data
 
 
 def append_worker_log(
@@ -118,7 +149,10 @@ def build_status(
         "updated_at": utc_now(),
     }
 
-    data.update(extra)
+    data.update(
+        extra
+    )
+
     return data
 
 
@@ -134,9 +168,9 @@ def validate_return_file(
         base / return_path
     ).resolve()
 
-    # 如果 target 不在 base 目录中，
-    # relative_to 会抛出 ValueError
-    target.relative_to(base)
+    target.relative_to(
+        base
+    )
 
     return target
 
@@ -165,6 +199,10 @@ def collect_return_files(
     )
 
     for requested_path in return_files:
+        requested_path = str(
+            requested_path
+        )
+
         target = validate_return_file(
             user_directory,
             requested_path,
@@ -174,8 +212,12 @@ def collect_return_files(
 
         files.append(
             {
-                "requested_path": requested_path,
-                "absolute_path": str(target),
+                "requested_path": (
+                    requested_path
+                ),
+                "absolute_path": str(
+                    target
+                ),
                 "exists": exists,
                 "size": (
                     target.stat().st_size
@@ -215,13 +257,15 @@ def stop_process_group(
     """
 
     if process.poll() is not None:
-        return process.returncode, False
+        return (
+            process.returncode,
+            False,
+        )
 
     try:
         process_group_id = os.getpgid(
             process.pid
         )
-        # process_group_id 代表用户任务所属的进程组 ID
 
         append_worker_log(
             worker_log_path,
@@ -237,8 +281,10 @@ def stop_process_group(
         )
 
     except ProcessLookupError:
-        # 发送信号之前程序已经退出
-        return process.poll(), False
+        return (
+            process.poll(),
+            False,
+        )
 
     try:
         exit_code = process.wait(
@@ -253,7 +299,10 @@ def stop_process_group(
             ),
         )
 
-        return exit_code, False
+        return (
+            exit_code,
+            False,
+        )
 
     except subprocess.TimeoutExpired:
         append_worker_log(
@@ -275,15 +324,14 @@ def stop_process_group(
         )
 
     except ProcessLookupError:
-        # 发送 SIGKILL 前程序刚好退出
         pass
 
     try:
         exit_code = process.wait(
             timeout=10
         )
+
     except subprocess.TimeoutExpired:
-        # 正常情况下 SIGKILL 后会很快退出
         exit_code = process.poll()
 
     append_worker_log(
@@ -294,7 +342,11 @@ def stop_process_group(
         ),
     )
 
-    return exit_code, True
+    return (
+        exit_code,
+        True,
+    )
+
 
 def run_preparation_command(
     command: list[str],
@@ -309,6 +361,11 @@ def run_preparation_command(
     命令输出会写入 task.log，
     因此客户端可以实时看到安装过程。
     """
+
+    if timeout_seconds <= 0:
+        raise TimeoutError(
+            f"{description}没有剩余可用时间"
+        )
 
     full_command = [
         "runuser",
@@ -325,13 +382,19 @@ def run_preparation_command(
         task_log.write(
             (
                 f"\n[SuanQi] {description}\n"
-            ).encode("utf-8")
+            ).encode(
+                "utf-8"
+            )
         )
+
+        task_log.flush()
 
         try:
             result = subprocess.run(
                 full_command,
-                cwd=str(user_directory),
+                cwd=str(
+                    user_directory
+                ),
                 stdin=subprocess.DEVNULL,
                 stdout=task_log,
                 stderr=subprocess.STDOUT,
@@ -350,6 +413,7 @@ def run_preparation_command(
             f"退出码={result.returncode}"
         )
 
+
 def create_task_virtualenv(
     user_directory: Path,
     task_log_path: Path,
@@ -360,7 +424,6 @@ def create_task_virtualenv(
     virtualenv_directory = (
         user_directory / ".venv"
     )
-    # virtualenv_directory 是任务独立虚拟环境目录
 
     virtualenv_python = (
         virtualenv_directory
@@ -376,12 +439,16 @@ def create_task_virtualenv(
             "/usr/bin/python3",
             "-m",
             "venv",
-            str(virtualenv_directory),
+            str(
+                virtualenv_directory
+            ),
         ],
         user_directory=user_directory,
         task_log_path=task_log_path,
         timeout_seconds=timeout_seconds,
-        description="正在创建 Python 虚拟环境……",
+        description=(
+            "正在创建 Python 虚拟环境……"
+        ),
     )
 
     if not virtualenv_python.is_file():
@@ -391,12 +458,16 @@ def create_task_virtualenv(
 
     return virtualenv_python
 
+
 def install_task_requirements(
     virtualenv_python: Path,
     user_directory: Path,
     requirements_filename: str | None,
     task_log_path: Path,
     timeout_seconds: int,
+    pip_index_url: str,
+    pip_network_timeout_seconds: int,
+    pip_retry_count: int,
 ) -> None:
     """由 worker 安装 requirements.txt。"""
 
@@ -414,25 +485,48 @@ def install_task_requirements(
 
     if not requirements_path.is_file():
         raise FileNotFoundError(
-            f"未找到 requirements 文件："
+            "未找到 requirements 文件："
             f"{requirements_path}"
         )
 
     run_preparation_command(
         command=[
-            str(virtualenv_python),
+            str(
+                virtualenv_python
+            ),
             "-m",
             "pip",
             "install",
+
             "--disable-pip-version-check",
+
+            "--index-url",
+            pip_index_url,
+
+            "--timeout",
+            str(
+                pip_network_timeout_seconds
+            ),
+
+            "--retries",
+            str(
+                pip_retry_count
+            ),
+
             "-r",
-            str(requirements_path),
+            str(
+                requirements_path
+            ),
         ],
         user_directory=user_directory,
         task_log_path=task_log_path,
         timeout_seconds=timeout_seconds,
-        description="正在安装 requirements.txt……",
+        description=(
+            "正在通过腾讯云镜像安装 "
+            "requirements.txt……"
+        ),
     )
+
 
 def install_task_packages(
     virtualenv_python: Path,
@@ -440,6 +534,9 @@ def install_task_packages(
     packages: list[str],
     task_log_path: Path,
     timeout_seconds: int,
+    pip_index_url: str,
+    pip_network_timeout_seconds: int,
+    pip_retry_count: int,
 ) -> None:
     """由 worker 安装用户通过 -i 指定的软件包。"""
 
@@ -454,21 +551,41 @@ def install_task_packages(
 
     run_preparation_command(
         command=[
-            str(virtualenv_python),
+            str(
+                virtualenv_python
+            ),
             "-m",
             "pip",
             "install",
+
             "--disable-pip-version-check",
+
+            "--index-url",
+            pip_index_url,
+
+            "--timeout",
+            str(
+                pip_network_timeout_seconds
+            ),
+
+            "--retries",
+            str(
+                pip_retry_count
+            ),
+
             *cleaned_packages,
         ],
         user_directory=user_directory,
         task_log_path=task_log_path,
         timeout_seconds=timeout_seconds,
         description=(
-            "正在安装额外依赖："
-            + ", ".join(cleaned_packages)
+            "正在通过腾讯云镜像安装额外依赖："
+            + ", ".join(
+                cleaned_packages
+            )
         ),
     )
+
 
 def prepare_task_environment(
     config: dict[str, Any],
@@ -484,15 +601,55 @@ def prepare_task_environment(
     """
 
     preparation_started = (
-        datetime.now(timezone.utc)
+        datetime.now(
+            timezone.utc
+        )
     )
+
+    pip_index_url = str(
+        config.get(
+            "pip_index_url",
+            DEFAULT_PIP_INDEX_URL,
+        )
+    ).strip()
+
+    pip_network_timeout_seconds = int(
+        config.get(
+            "pip_network_timeout_seconds",
+            DEFAULT_PIP_NETWORK_TIMEOUT_SECONDS,
+        )
+    )
+
+    pip_retry_count = int(
+        config.get(
+            "pip_retry_count",
+            DEFAULT_PIP_RETRY_COUNT,
+        )
+    )
+
+    if not pip_index_url:
+        raise ValueError(
+            "pip_index_url 不能为空"
+        )
+
+    if pip_network_timeout_seconds <= 0:
+        raise ValueError(
+            "pip_network_timeout_seconds 必须大于 0"
+        )
+
+    if pip_retry_count < 0:
+        raise ValueError(
+            "pip_retry_count 不能小于 0"
+        )
 
     virtualenv_python = (
         create_task_virtualenv(
             user_directory=(
                 user_directory
             ),
-            task_log_path=task_log_path,
+            task_log_path=(
+                task_log_path
+            ),
             timeout_seconds=(
                 preparation_timeout_seconds
             ),
@@ -500,52 +657,101 @@ def prepare_task_environment(
     )
 
     elapsed_seconds = (
-        datetime.now(timezone.utc)
+        datetime.now(
+            timezone.utc
+        )
         - preparation_started
     ).total_seconds()
-    # elapsed_seconds 是环境准备已经使用的秒数
 
-    remaining_seconds = max(
-        1,
-        int(
-            preparation_timeout_seconds
-            - elapsed_seconds
-        ),
+    remaining_seconds = int(
+        preparation_timeout_seconds
+        - elapsed_seconds
     )
 
+    if remaining_seconds <= 0:
+        raise TimeoutError(
+            "创建虚拟环境后已超过环境准备最大时间"
+        )
+
     install_task_requirements(
-        virtualenv_python=virtualenv_python,
-        user_directory=user_directory,
-        requirements_filename=config.get(
-            "requirements_filename"
+        virtualenv_python=(
+            virtualenv_python
         ),
-        task_log_path=task_log_path,
-        timeout_seconds=remaining_seconds,
+        user_directory=(
+            user_directory
+        ),
+        requirements_filename=(
+            config.get(
+                "requirements_filename"
+            )
+        ),
+        task_log_path=(
+            task_log_path
+        ),
+        timeout_seconds=(
+            remaining_seconds
+        ),
+        pip_index_url=(
+            pip_index_url
+        ),
+        pip_network_timeout_seconds=(
+            pip_network_timeout_seconds
+        ),
+        pip_retry_count=(
+            pip_retry_count
+        ),
     )
 
     elapsed_seconds = (
-        datetime.now(timezone.utc)
+        datetime.now(
+            timezone.utc
+        )
         - preparation_started
     ).total_seconds()
 
-    remaining_seconds = max(
-        1,
-        int(
-            preparation_timeout_seconds
-            - elapsed_seconds
+    remaining_seconds = int(
+        preparation_timeout_seconds
+        - elapsed_seconds
+    )
+
+    if remaining_seconds <= 0:
+        raise TimeoutError(
+            "安装 requirements.txt 后已超过"
+            "环境准备最大时间"
+        )
+
+    install_task_packages(
+        virtualenv_python=(
+            virtualenv_python
+        ),
+        user_directory=(
+            user_directory
+        ),
+        packages=(
+            config.get("packages")
+            or []
+        ),
+        task_log_path=(
+            task_log_path
+        ),
+        timeout_seconds=(
+            remaining_seconds
+        ),
+        pip_index_url=(
+            pip_index_url
+        ),
+        pip_network_timeout_seconds=(
+            pip_network_timeout_seconds
+        ),
+        pip_retry_count=(
+            pip_retry_count
         ),
     )
 
-    install_task_packages(
-        virtualenv_python=virtualenv_python,
-        user_directory=user_directory,
-        packages=config.get("packages") or [],
-        task_log_path=task_log_path,
-        timeout_seconds=remaining_seconds,
-    )
-
     total_elapsed_seconds = (
-        datetime.now(timezone.utc)
+        datetime.now(
+            timezone.utc
+        )
         - preparation_started
     ).total_seconds()
 
@@ -558,7 +764,6 @@ def prepare_task_environment(
         )
 
     return virtualenv_python
-
 
 
 def main() -> int:
@@ -595,29 +800,24 @@ def main() -> int:
     process: subprocess.Popen[bytes] | None = None
 
     worker_started_at = utc_now()
-    # worker_started_at 代表守护进程启动时间
 
     preparation_started_at: str | None = None
-    # preparation_started_at 代表环境准备开始时间
 
     preparation_finished_at: str | None = None
-    # preparation_finished_at 代表环境准备完成时间
 
     program_started_at: str | None = None
-    # program_started_at 代表 main.py 真正启动时间
 
-    max_use_seconds = DEFAULT_MAX_USE_SECONDS
-    # max_use_seconds 代表 main.py 最大运行秒数
+    max_use_seconds = (
+        DEFAULT_MAX_USE_SECONDS
+    )
 
     terminate_grace_seconds = (
         DEFAULT_TERMINATE_GRACE_SECONDS
     )
-    # terminate_grace_seconds 代表发送 SIGTERM 后等待秒数
 
     preparation_timeout_seconds = (
         DEFAULT_PREPARATION_TIMEOUT_SECONDS
     )
-    # preparation_timeout_seconds 代表环境准备最大秒数
 
     try:
         config = load_task_config(
@@ -683,6 +883,27 @@ def main() -> int:
             )
         )
 
+        pip_index_url = str(
+            config.get(
+                "pip_index_url",
+                DEFAULT_PIP_INDEX_URL,
+            )
+        ).strip()
+
+        pip_network_timeout_seconds = int(
+            config.get(
+                "pip_network_timeout_seconds",
+                DEFAULT_PIP_NETWORK_TIMEOUT_SECONDS,
+            )
+        )
+
+        pip_retry_count = int(
+            config.get(
+                "pip_retry_count",
+                DEFAULT_PIP_RETRY_COUNT,
+            )
+        )
+
         if max_use_seconds <= 0:
             raise ValueError(
                 "max_use_seconds 必须大于 0"
@@ -698,6 +919,21 @@ def main() -> int:
                 "preparation_timeout_seconds 必须大于 0"
             )
 
+        if not pip_index_url:
+            raise ValueError(
+                "pip_index_url 不能为空"
+            )
+
+        if pip_network_timeout_seconds <= 0:
+            raise ValueError(
+                "pip_network_timeout_seconds 必须大于 0"
+            )
+
+        if pip_retry_count < 0:
+            raise ValueError(
+                "pip_retry_count 不能小于 0"
+            )
+
         append_worker_log(
             worker_log_path,
             "守护进程启动",
@@ -711,7 +947,13 @@ def main() -> int:
                 "程序最大运行时间："
                 f"{max_use_seconds} 秒，"
                 "终止宽限时间："
-                f"{terminate_grace_seconds} 秒"
+                f"{terminate_grace_seconds} 秒，"
+                "pip 镜像："
+                f"{pip_index_url}，"
+                "pip 网络超时："
+                f"{pip_network_timeout_seconds} 秒，"
+                "pip 重试次数："
+                f"{pip_retry_count}"
             ),
         )
 
@@ -723,7 +965,9 @@ def main() -> int:
                 worker_started_at=(
                     worker_started_at
                 ),
-                worker_pid=os.getpid(),
+                worker_pid=(
+                    os.getpid()
+                ),
                 preparation_timeout_seconds=(
                     preparation_timeout_seconds
                 ),
@@ -733,15 +977,18 @@ def main() -> int:
                 terminate_grace_seconds=(
                     terminate_grace_seconds
                 ),
-                message="守护进程正在启动",
+                pip_index_url=(
+                    pip_index_url
+                ),
+                message=(
+                    "守护进程正在启动"
+                ),
             ),
         )
 
-        # =========================
-        # 第一阶段：准备 Python 环境
-        # =========================
-
-        preparation_started_at = utc_now()
+        preparation_started_at = (
+            utc_now()
+        )
 
         atomic_write_json(
             status_path,
@@ -754,14 +1001,21 @@ def main() -> int:
                 preparation_started_at=(
                     preparation_started_at
                 ),
-                worker_pid=os.getpid(),
+                worker_pid=(
+                    os.getpid()
+                ),
                 preparation_timeout_seconds=(
                     preparation_timeout_seconds
                 ),
                 max_use_seconds=(
                     max_use_seconds
                 ),
-                message="正在准备 Python 运行环境",
+                pip_index_url=(
+                    pip_index_url
+                ),
+                message=(
+                    "正在准备 Python 运行环境"
+                ),
             ),
         )
 
@@ -773,16 +1027,21 @@ def main() -> int:
         virtualenv_python = (
             prepare_task_environment(
                 config=config,
-                user_directory=user_directory,
-                task_log_path=task_log_path,
+                user_directory=(
+                    user_directory
+                ),
+                task_log_path=(
+                    task_log_path
+                ),
                 preparation_timeout_seconds=(
                     preparation_timeout_seconds
                 ),
             )
         )
-        # virtualenv_python 是 worker 创建的虚拟环境 Python 路径
 
-        preparation_finished_at = utc_now()
+        preparation_finished_at = (
+            utc_now()
+        )
 
         append_worker_log(
             worker_log_path,
@@ -792,24 +1051,18 @@ def main() -> int:
             ),
         )
 
-        # =========================
-        # 第二阶段：构造用户程序命令
-        # =========================
-
         main_filename = str(
             config.get(
                 "main_filename",
                 "main.py",
             )
         )
-        # main_filename 是需要运行的 Python 文件名
 
         main_path = (
             user_directory
             / main_filename
         ).resolve()
 
-        # 防止 main_filename 使用 ../ 越过任务目录
         main_path.relative_to(
             user_directory.resolve()
         )
@@ -827,22 +1080,28 @@ def main() -> int:
             "nice",
             "-n",
             "5",
-            str(virtualenv_python),
+            str(
+                virtualenv_python
+            ),
             "-u",
-            str(main_path),
+            str(
+                main_path
+            ),
         ]
 
-        environment = os.environ.copy()
+        environment = (
+            os.environ.copy()
+        )
 
-        cpu_count = os.cpu_count() or 1
-        # cpu_count 代表服务器检测到的逻辑 CPU 核心数
+        cpu_count = (
+            os.cpu_count()
+            or 1
+        )
 
         usable_cpu_count = max(
             1,
             cpu_count - 1,
         )
-        # usable_cpu_count 代表计算库可使用的线程数
-        # 留一个逻辑核心给系统和 worker
 
         for variable_name in (
             "OMP_NUM_THREADS",
@@ -854,18 +1113,11 @@ def main() -> int:
                 usable_cpu_count
             )
 
-        # =========================
-        # 第三阶段：启动用户程序
-        # =========================
-
         timed_out = False
-        # timed_out 表示用户程序是否运行超时
 
         forced_kill = False
-        # forced_kill 表示是否最终使用了 SIGKILL
 
         exit_code: int | None = None
-        # exit_code 是用户程序最终退出码
 
         with task_log_path.open(
             "ab",
@@ -873,22 +1125,24 @@ def main() -> int:
         ) as task_log:
             process = subprocess.Popen(
                 command,
-                cwd=str(user_directory),
+                cwd=str(
+                    user_directory
+                ),
                 stdin=subprocess.DEVNULL,
                 stdout=task_log,
                 stderr=subprocess.STDOUT,
-
-                # 创建独立会话和进程组
-                # 后续可以一次停止 main.py 和所有子进程
                 start_new_session=True,
-
                 env=environment,
             )
 
-            program_started_at = utc_now()
+            program_started_at = (
+                utc_now()
+            )
 
             pid_path.write_text(
-                str(process.pid),
+                str(
+                    process.pid
+                ),
                 encoding="utf-8",
             )
 
@@ -909,12 +1163,18 @@ def main() -> int:
                     started_at=(
                         program_started_at
                     ),
-                    worker_pid=os.getpid(),
-                    main_pid=process.pid,
+                    worker_pid=(
+                        os.getpid()
+                    ),
+                    main_pid=(
+                        process.pid
+                    ),
                     max_use_seconds=(
                         max_use_seconds
                     ),
-                    message="用户程序正在运行",
+                    message=(
+                        "用户程序正在运行"
+                    ),
                 ),
             )
 
@@ -927,16 +1187,16 @@ def main() -> int:
             )
 
             try:
-                # 最大运行时间从 main.py 启动后开始计算
                 exit_code = process.wait(
-                    timeout=max_use_seconds
+                    timeout=(
+                        max_use_seconds
+                    )
                 )
 
             except subprocess.TimeoutExpired:
                 timed_out = True
 
                 timeout_at = utc_now()
-                # timeout_at 代表达到最大运行时间的时刻
 
                 append_worker_log(
                     worker_log_path,
@@ -963,9 +1223,15 @@ def main() -> int:
                         started_at=(
                             program_started_at
                         ),
-                        timeout_at=timeout_at,
-                        worker_pid=os.getpid(),
-                        main_pid=process.pid,
+                        timeout_at=(
+                            timeout_at
+                        ),
+                        worker_pid=(
+                            os.getpid()
+                        ),
+                        main_pid=(
+                            process.pid
+                        ),
                         max_use_seconds=(
                             max_use_seconds
                         ),
@@ -976,38 +1242,44 @@ def main() -> int:
                     ),
                 )
 
-                exit_code, forced_kill = (
-                    stop_process_group(
-                        process=process,
-                        grace_seconds=(
-                            terminate_grace_seconds
-                        ),
-                        worker_log_path=(
-                            worker_log_path
-                        ),
-                    )
+                (
+                    exit_code,
+                    forced_kill,
+                ) = stop_process_group(
+                    process=process,
+                    grace_seconds=(
+                        terminate_grace_seconds
+                    ),
+                    worker_log_path=(
+                        worker_log_path
+                    ),
                 )
-
-        # =========================
-        # 第四阶段：整理最终状态
-        # =========================
 
         finished_at = utc_now()
 
         if timed_out:
-            final_status = "TIMEOUT"
+            final_status = (
+                "TIMEOUT"
+            )
 
         elif exit_code == 0:
-            final_status = "SUCCESS"
+            final_status = (
+                "SUCCESS"
+            )
 
         else:
-            final_status = "FAILED"
-
-        files, missing_files = (
-            collect_return_files(
-                config=config,
-                user_directory=user_directory,
+            final_status = (
+                "FAILED"
             )
+
+        (
+            files,
+            missing_files,
+        ) = collect_return_files(
+            config=config,
+            user_directory=(
+                user_directory
+            ),
         )
 
         if final_status == "SUCCESS":
@@ -1051,14 +1323,20 @@ def main() -> int:
                 started_at=(
                     program_started_at
                 ),
-                finished_at=finished_at,
-                worker_pid=os.getpid(),
+                finished_at=(
+                    finished_at
+                ),
+                worker_pid=(
+                    os.getpid()
+                ),
                 main_pid=(
                     process.pid
                     if process is not None
                     else None
                 ),
-                exit_code=exit_code,
+                exit_code=(
+                    exit_code
+                ),
                 max_use_seconds=(
                     max_use_seconds
                 ),
@@ -1068,19 +1346,31 @@ def main() -> int:
                 terminate_grace_seconds=(
                     terminate_grace_seconds
                 ),
-                timed_out=timed_out,
-                forced_kill=forced_kill,
-                message=final_message,
+                timed_out=(
+                    timed_out
+                ),
+                forced_kill=(
+                    forced_kill
+                ),
+                message=(
+                    final_message
+                ),
             ),
         )
 
         atomic_write_json(
             manifest_path,
             {
-                "task_id": config["task_id"],
+                "task_id": (
+                    config["task_id"]
+                ),
                 "completed": True,
-                "status": final_status,
-                "program_exit_code": exit_code,
+                "status": (
+                    final_status
+                ),
+                "program_exit_code": (
+                    exit_code
+                ),
 
                 "worker_started_at": (
                     worker_started_at
@@ -1114,11 +1404,31 @@ def main() -> int:
                     terminate_grace_seconds
                 ),
 
-                "timed_out": timed_out,
-                "forced_kill": forced_kill,
+                "pip_index_url": (
+                    pip_index_url
+                ),
+
+                "pip_network_timeout_seconds": (
+                    pip_network_timeout_seconds
+                ),
+
+                "pip_retry_count": (
+                    pip_retry_count
+                ),
+
+                "timed_out": (
+                    timed_out
+                ),
+
+                "forced_kill": (
+                    forced_kill
+                ),
 
                 "files": files,
-                "missing_files": missing_files,
+
+                "missing_files": (
+                    missing_files
+                ),
             },
         )
 
@@ -1131,13 +1441,11 @@ def main() -> int:
             return 0
 
         if final_status == "TIMEOUT":
-            # 124 是 Linux 命令中常用的超时退出码
             return 124
 
         return 1
 
     except BaseException as error:
-        # worker 出错时，尽量停止仍在运行的用户程序
         if process is not None:
             try:
                 stop_process_group(
@@ -1147,8 +1455,11 @@ def main() -> int:
                     ),
                     worker_log_path=(
                         worker_log_path
-                        if worker_log_path is not None
-                        else Path("/tmp/suanqi-worker.log")
+                        if worker_log_path
+                        is not None
+                        else Path(
+                            "/tmp/suanqi-worker.log"
+                        )
                     ),
                 )
             except Exception:
@@ -1156,7 +1467,6 @@ def main() -> int:
 
         failed_at = utc_now()
 
-        # 只有路径已经成功解析后，才能写状态文件
         if (
             status_path is not None
             and config
@@ -1179,8 +1489,12 @@ def main() -> int:
                         started_at=(
                             program_started_at
                         ),
-                        failed_at=failed_at,
-                        worker_pid=os.getpid(),
+                        failed_at=(
+                            failed_at
+                        ),
+                        worker_pid=(
+                            os.getpid()
+                        ),
                         main_pid=(
                             process.pid
                             if process is not None
@@ -1189,7 +1503,9 @@ def main() -> int:
                         error_type=(
                             error.__class__.__name__
                         ),
-                        error_message=str(error),
+                        error_message=(
+                            str(error)
+                        ),
                         message=(
                             "守护进程执行失败"
                         ),
@@ -1215,4 +1531,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        main()
+    )
