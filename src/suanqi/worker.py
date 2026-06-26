@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import signal
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -233,6 +238,524 @@ def collect_return_files(
             )
 
     return files, missing_files
+
+
+def _cos_target_enabled(config: dict[str, Any]) -> bool:
+    cos_target = config.get("cos_target") or {}
+    return bool(cos_target.get("enabled"))
+
+
+def _cos_target_upload_prefix(config: dict[str, Any]) -> str:
+    cos_target = config.get("cos_target") or {}
+    return str(cos_target.get("prefix") or "").strip().lstrip("/")
+
+
+
+def metadata_get_text(path: str, timeout_seconds: int = 10) -> str:
+    """
+    读取腾讯云 CVM 实例元数据。
+
+    path：元数据路径，例如 cam/security-credentials/。
+    timeout_seconds：单次请求超时时间，单位秒。
+    """
+
+    normalized_path = path.strip().lstrip("/")
+    url = (
+        "http://metadata.tencentyun.com/latest/meta-data/"
+        + normalized_path
+    )
+
+    with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
+        return response.read().decode("utf-8").strip()
+
+
+def get_instance_role_credentials(
+    worker_log_path: Path,
+    maximum_retry_count: int = 6,
+) -> dict[str, Any]:
+    """
+    获取实例角色临时密钥。
+
+    worker_log_path：worker 日志文件路径。
+    maximum_retry_count：最大重试次数。
+    """
+
+    last_error: BaseException | None = None
+
+    for attempt_number in range(maximum_retry_count):
+        # attempt_number：当前尝试次数，从 0 开始
+        try:
+            role_list_text = metadata_get_text("cam/security-credentials/")
+            role_names = [
+                line.strip()
+                for line in role_list_text.splitlines()
+                if line.strip()
+            ]
+
+            if not role_names:
+                raise RuntimeError("实例没有返回可用角色名称")
+
+            role_name = role_names[0]
+            credentials_text = metadata_get_text(
+                "cam/security-credentials/" + role_name
+            )
+            credentials = json.loads(credentials_text)
+
+            missing_keys = [
+                key
+                for key in ("TmpSecretId", "TmpSecretKey", "Token")
+                if not credentials.get(key)
+            ]
+
+            if missing_keys:
+                raise RuntimeError(
+                    "临时密钥字段缺失：" + ", ".join(missing_keys)
+                )
+
+            credentials["RoleName"] = role_name
+            return credentials
+
+        except BaseException as error:
+            last_error = error
+            retry_delay_seconds = min(2 ** attempt_number, 15)
+            append_worker_log(
+                worker_log_path,
+                (
+                    "获取实例角色临时密钥失败，"
+                    f"第 {attempt_number + 1} 次："
+                    f"{error.__class__.__name__}：{error}，"
+                    f"{retry_delay_seconds} 秒后重试"
+                ),
+            )
+            time.sleep(retry_delay_seconds)
+
+    raise RuntimeError(
+        "无法获取实例角色临时密钥："
+        f"{last_error.__class__.__name__ if last_error else 'Unknown'}："
+        f"{last_error}"
+    )
+
+
+def is_temporary_credential_error(error: BaseException) -> bool:
+    """判断异常是否大概率与临时密钥过期或无效有关。"""
+
+    text = str(error).lower()
+    keywords = (
+        "expiredtoken",
+        "invalidtoken",
+        "token expired",
+        "token has expired",
+        "signature expired",
+        "request has expired",
+        "secretid",
+        "signaturedoesnotmatch",
+    )
+    return any(keyword in text for keyword in keywords)
+
+
+def sign_sha256(key: bytes, message: str) -> bytes:
+    """HMAC-SHA256 签名。"""
+
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+def build_tencentcloud_authorization(
+    secret_id: str,
+    secret_key: str,
+    service: str,
+    payload: str,
+    timestamp: int,
+) -> str:
+    """
+    构造腾讯云 API 3.0 Authorization 头。
+
+    secret_id：临时密钥 ID。
+    secret_key：临时密钥 Key。
+    service：服务名，例如 cvm。
+    payload：请求 JSON 字符串。
+    timestamp：Unix 秒级时间戳。
+    """
+
+    date = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")
+    http_request_method = "POST"
+    canonical_uri = "/"
+    canonical_query_string = ""
+    canonical_headers = (
+        "content-type:application/json; charset=utf-8\n"
+        f"host:{service}.tencentcloudapi.com\n"
+    )
+    signed_headers = "content-type;host"
+    hashed_request_payload = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    canonical_request = "\n".join(
+        [
+            http_request_method,
+            canonical_uri,
+            canonical_query_string,
+            canonical_headers,
+            signed_headers,
+            hashed_request_payload,
+        ]
+    )
+    credential_scope = f"{date}/{service}/tc3_request"
+    hashed_canonical_request = hashlib.sha256(
+        canonical_request.encode("utf-8")
+    ).hexdigest()
+    string_to_sign = "\n".join(
+        [
+            "TC3-HMAC-SHA256",
+            str(timestamp),
+            credential_scope,
+            hashed_canonical_request,
+        ]
+    )
+
+    secret_date = sign_sha256(("TC3" + secret_key).encode("utf-8"), date)
+    secret_service = sign_sha256(secret_date, service)
+    secret_signing = sign_sha256(secret_service, "tc3_request")
+    signature = hmac.new(
+        secret_signing,
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    return (
+        "TC3-HMAC-SHA256 "
+        f"Credential={secret_id}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, "
+        f"Signature={signature}"
+    )
+
+
+def call_tencentcloud_api(
+    service: str,
+    action: str,
+    version: str,
+    region: str,
+    payload_data: dict[str, Any],
+    credentials: dict[str, Any],
+    timeout_seconds: int = 15,
+) -> dict[str, Any]:
+    """
+    使用临时密钥调用腾讯云 API。
+
+    service：服务名，例如 cvm。
+    action：接口名，例如 TerminateInstances。
+    version：接口版本，例如 2017-03-12。
+    region：地域，例如 ap-nanjing。
+    payload_data：接口 JSON 参数。
+    credentials：实例角色临时密钥。
+    """
+
+    endpoint = f"https://{service}.tencentcloudapi.com/"
+    payload = json.dumps(payload_data, separators=(",", ":"))
+    timestamp = int(time.time())
+    headers = {
+        "Authorization": build_tencentcloud_authorization(
+            secret_id=str(credentials["TmpSecretId"]),
+            secret_key=str(credentials["TmpSecretKey"]),
+            service=service,
+            payload=payload,
+            timestamp=timestamp,
+        ),
+        "Content-Type": "application/json; charset=utf-8",
+        "Host": f"{service}.tencentcloudapi.com",
+        "X-TC-Action": action,
+        "X-TC-Version": version,
+        "X-TC-Timestamp": str(timestamp),
+        "X-TC-Region": region,
+        "X-TC-Token": str(credentials["Token"]),
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=payload.encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            response_text = response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        response_text = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"腾讯云 API HTTP {error.code}：{response_text}"
+        ) from error
+
+    result = json.loads(response_text)
+    response_data = result.get("Response") or {}
+    if "Error" in response_data:
+        api_error = response_data["Error"]
+        raise RuntimeError(
+            "腾讯云 API 错误："
+            f"{api_error.get('Code')}，"
+            f"{api_error.get('Message')}"
+        )
+
+    return response_data
+
+
+def terminate_current_instance(
+    config: dict[str, Any],
+    worker_log_path: Path,
+) -> bool:
+    """
+    使用实例角色临时密钥释放当前 CVM。
+
+    config：任务配置。
+    worker_log_path：worker 日志文件路径。
+    """
+
+    if not bool(config.get("enable_self_destroy")):
+        append_worker_log(worker_log_path, "自销毁跳过：配置未启用")
+        return False
+
+    provider = str(config.get("provider") or "")
+    if provider and provider != "tencentcloud":
+        append_worker_log(worker_log_path, f"自销毁跳过：暂不支持云厂商 {provider}")
+        return False
+
+    instance_id = str(config.get("instance_id") or "").strip()
+    region = str(config.get("instance_region") or "").strip()
+
+    if not instance_id:
+        try:
+            instance_id = metadata_get_text("instance-id")
+        except BaseException as error:
+            append_worker_log(worker_log_path, f"自销毁失败：无法读取实例 ID：{error}")
+            return False
+
+    if not region:
+        for metadata_path in ("placement/region", "region"):
+            try:
+                region = metadata_get_text(metadata_path)
+                if region:
+                    break
+            except BaseException:
+                pass
+
+    if not region:
+        append_worker_log(worker_log_path, "自销毁失败：无法确定 CVM 地域")
+        return False
+
+    try:
+        credentials = get_instance_role_credentials(worker_log_path)
+        response_data = call_tencentcloud_api(
+            service="cvm",
+            action="TerminateInstances",
+            version="2017-03-12",
+            region=region,
+            payload_data={
+                "InstanceIds": [instance_id],
+                "ReleaseAddress": True,
+            },
+            credentials=credentials,
+        )
+        append_worker_log(
+            worker_log_path,
+            (
+                "实例自销毁请求已提交："
+                f"{instance_id}，RequestId={response_data.get('RequestId')}"
+            ),
+        )
+        return True
+    except BaseException as error:
+        append_worker_log(
+            worker_log_path,
+            f"实例自销毁失败：{error.__class__.__name__}：{error}",
+        )
+        return False
+
+
+def schedule_self_destroy(config: dict[str, Any], worker_log_path: Path) -> None:
+    """
+    启动后台延迟自销毁进程。
+
+    修复点：
+    1. 不再静默丢弃 stderr，所有异常写入 self_destroy.log。
+    2. helper 不再 import 整个 worker.py，避免导入失败导致无日志。
+    3. 直接在 helper 内实现元数据、临时密钥、签名和 TerminateInstances。
+    4. 如果 helper 启动失败，会立刻在 worker.log 中显示。
+    """
+
+    delay_seconds = int(config.get("self_destroy_delay_seconds", 10))
+    delay_seconds = max(0, min(delay_seconds, 300))
+    helper_config_path = worker_log_path.parent / "self_destroy_config.json"
+    helper_script_path = worker_log_path.parent / "self_destroy.py"
+    helper_log_path = worker_log_path.parent / "self_destroy.log"
+
+    atomic_write_json(helper_config_path, config)
+
+    helper_script = SELF_DESTROY_HELPER_TEMPLATE
+    helper_script = (
+        helper_script
+        .replace("__CONFIG_PATH__", repr(str(helper_config_path)))
+        .replace("__WORKER_LOG_PATH__", repr(str(worker_log_path)))
+        .replace("__SELF_LOG_PATH__", repr(str(helper_log_path)))
+        .replace("__DELAY_SECONDS__", str(delay_seconds))
+    )
+
+    helper_script_path.write_text(helper_script, encoding="utf-8")
+    os.chmod(helper_script_path, 0o700)
+
+    with helper_log_path.open("a", encoding="utf-8") as helper_log_file:
+        subprocess.Popen(
+            [sys.executable, str(helper_script_path)],
+            stdout=helper_log_file,
+            stderr=helper_log_file,
+            start_new_session=True,
+        )
+
+    append_worker_log(
+        worker_log_path,
+        (
+            f"已启动延迟自销毁进程，延迟 {delay_seconds} 秒；"
+            f"日志：{helper_log_path}"
+        ),
+    )
+
+
+SELF_DESTROY_HELPER_TEMPLATE = '#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n"""SuanQi 服务器端自销毁辅助进程。"""\n\nimport hashlib\nimport hmac\nimport json\nimport pathlib\nimport time\nimport traceback\nimport urllib.error\nimport urllib.request\nfrom datetime import datetime, timezone\n\nCONFIG_PATH = pathlib.Path(__CONFIG_PATH__)\nWORKER_LOG_PATH = pathlib.Path(__WORKER_LOG_PATH__)\nSELF_LOG_PATH = pathlib.Path(__SELF_LOG_PATH__)\nDELAY_SECONDS = __DELAY_SECONDS__\n\nMETADATA_BASE_URL = "http://metadata.tencentyun.com/latest/meta-data"\n\n\ndef write_log(message):\n    timestamp = datetime.now(timezone.utc).isoformat()\n    line = f"[{timestamp}] {message}\\n"\n    for path in (SELF_LOG_PATH, WORKER_LOG_PATH):\n        try:\n            path.parent.mkdir(parents=True, exist_ok=True)\n            with path.open("a", encoding="utf-8") as f:\n                f.write(line)\n        except Exception:\n            pass\n\n\ndef read_json(path):\n    return json.loads(path.read_text(encoding="utf-8"))\n\n\ndef http_get_text(url, timeout_seconds=10):\n    request = urllib.request.Request(url, headers={"User-Agent": "suanqi-self-destroy/0.1.3"})\n    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:\n        return response.read().decode("utf-8").strip()\n\n\ndef metadata_get_text(path, timeout_seconds=10):\n    return http_get_text(f"{METADATA_BASE_URL}/{path.lstrip(\'/\')}", timeout_seconds=timeout_seconds)\n\n\ndef get_credentials(maximum_retry_count=8):\n    last_error = None\n    for attempt_number in range(maximum_retry_count):\n        try:\n            role_name = metadata_get_text("cam/security-credentials/").strip().splitlines()[0].strip()\n            if not role_name:\n                raise RuntimeError("实例没有返回 CAM 角色名称")\n            raw = metadata_get_text("cam/security-credentials/" + role_name)\n            data = json.loads(raw)\n            credentials = data.get("Credentials") if isinstance(data.get("Credentials"), dict) else data\n            if not isinstance(credentials, dict):\n                raise RuntimeError(f"临时密钥响应格式异常：{data}")\n            for key in ("TmpSecretId", "TmpSecretKey", "Token"):\n                if not credentials.get(key):\n                    raise RuntimeError(f"临时密钥缺少字段：{key}，响应：{data}")\n            write_log(f"已获取实例角色临时密钥，role={role_name}")\n            return credentials\n        except Exception as error:\n            last_error = error\n            wait_seconds = min(2 ** attempt_number, 10)\n            write_log(f"获取临时密钥失败，第 {attempt_number + 1} 次：{error}，{wait_seconds}s 后重试")\n            time.sleep(wait_seconds)\n    raise RuntimeError(f"无法获取实例角色临时密钥：{last_error}")\n\n\ndef sign_sha256(key, message):\n    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()\n\n\ndef build_authorization(secret_id, secret_key, service, payload, timestamp):\n    date = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")\n    canonical_request = "\\n".join([\n        "POST",\n        "/",\n        "",\n        "content-type:application/json; charset=utf-8\\n" + f"host:{service}.tencentcloudapi.com\\n",\n        "content-type;host",\n        hashlib.sha256(payload.encode("utf-8")).hexdigest(),\n    ])\n    credential_scope = f"{date}/{service}/tc3_request"\n    string_to_sign = "\\n".join([\n        "TC3-HMAC-SHA256",\n        str(timestamp),\n        credential_scope,\n        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),\n    ])\n    secret_date = sign_sha256(("TC3" + secret_key).encode("utf-8"), date)\n    secret_service = sign_sha256(secret_date, service)\n    secret_signing = sign_sha256(secret_service, "tc3_request")\n    signature = hmac.new(secret_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()\n    return (\n        "TC3-HMAC-SHA256 "\n        f"Credential={secret_id}/{credential_scope}, "\n        "SignedHeaders=content-type;host, "\n        f"Signature={signature}"\n    )\n\n\ndef call_api(service, action, version, region, payload_data, credentials, timeout_seconds=20):\n    payload = json.dumps(payload_data, separators=(",", ":"))\n    timestamp = int(time.time())\n    headers = {\n        "Authorization": build_authorization(\n            secret_id=str(credentials["TmpSecretId"]),\n            secret_key=str(credentials["TmpSecretKey"]),\n            service=service,\n            payload=payload,\n            timestamp=timestamp,\n        ),\n        "Content-Type": "application/json; charset=utf-8",\n        "Host": f"{service}.tencentcloudapi.com",\n        "X-TC-Action": action,\n        "X-TC-Version": version,\n        "X-TC-Timestamp": str(timestamp),\n        "X-TC-Region": region,\n        "X-TC-Token": str(credentials["Token"]),\n        "X-TC-Language": "zh-CN",\n    }\n    request = urllib.request.Request(\n        f"https://{service}.tencentcloudapi.com/",\n        data=payload.encode("utf-8"),\n        headers=headers,\n        method="POST",\n    )\n    try:\n        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:\n            response_text = response.read().decode("utf-8")\n    except urllib.error.HTTPError as error:\n        response_text = error.read().decode("utf-8", errors="replace")\n        raise RuntimeError(f"腾讯云 API HTTP {error.code}：{response_text}") from error\n    data = json.loads(response_text)\n    response_data = data.get("Response") or {}\n    if "Error" in response_data:\n        api_error = response_data["Error"]\n        raise RuntimeError(f"腾讯云 API 错误：{api_error.get(\'Code\')}，{api_error.get(\'Message\')}，RequestId={response_data.get(\'RequestId\')}")\n    return response_data\n\n\ndef main():\n    time.sleep(DELAY_SECONDS)\n    config = read_json(CONFIG_PATH)\n    if not bool(config.get("enable_self_destroy")):\n        write_log("自销毁跳过：配置未启用")\n        return 0\n\n    instance_id = str(config.get("instance_id") or "").strip()\n    region = str(config.get("instance_region") or "").strip()\n\n    if not instance_id:\n        instance_id = metadata_get_text("instance-id")\n    if not region:\n        for metadata_path in ("placement/region", "region"):\n            try:\n                region = metadata_get_text(metadata_path)\n                if region:\n                    break\n            except Exception as error:\n                write_log(f"读取地域 {metadata_path} 失败：{error}")\n\n    if not instance_id:\n        raise RuntimeError("无法确定当前实例 ID")\n    if not region:\n        raise RuntimeError("无法确定当前实例地域")\n\n    write_log(f"准备自销毁：region={region}，instance_id={instance_id}")\n    credentials = get_credentials()\n\n    try:\n        describe_response = call_api(\n            service="cvm",\n            action="DescribeInstances",\n            version="2017-03-12",\n            region=region,\n            payload_data={"InstanceIds": [instance_id]},\n            credentials=credentials,\n        )\n        total_count = describe_response.get("TotalCount")\n        write_log(f"DescribeInstances 成功：TotalCount={total_count}，RequestId={describe_response.get(\'RequestId\')}")\n    except Exception as error:\n        write_log(f"DescribeInstances 失败，但继续尝试 TerminateInstances：{error}")\n\n    terminate_response = call_api(\n        service="cvm",\n        action="TerminateInstances",\n        version="2017-03-12",\n        region=region,\n        payload_data={\n            "InstanceIds": [instance_id],\n            "ReleaseAddress": True,\n            "ReleasePrepaidDataDisks": False,\n        },\n        credentials=credentials,\n    )\n    write_log(f"实例自销毁请求已提交：{instance_id}，RequestId={terminate_response.get(\'RequestId\')}")\n    return 0\n\n\nif __name__ == "__main__":\n    try:\n        raise SystemExit(main())\n    except SystemExit:\n        raise\n    except Exception as error:\n        write_log(f"自销毁辅助进程异常：{error.__class__.__name__}：{error}")\n        try:\n            write_log(traceback.format_exc())\n        except Exception:\n            pass\n        raise SystemExit(1)\n'
+
+def upload_task_artifacts(
+    config: dict[str, Any],
+    status_path: Path,
+    task_log_path: Path,
+    worker_log_path: Path,
+    manifest_path: Path,
+    user_directory: Path,
+) -> None:
+    if not _cos_target_enabled(config):
+        return
+
+    cos_target = config.get("cos_target") or {}
+    region = str(cos_target.get("region") or "")
+    bucket = str(cos_target.get("bucket") or "")
+    prefix = _cos_target_upload_prefix(config)
+
+    if not region or not bucket or not prefix:
+        append_worker_log(worker_log_path, "COS 上传跳过：配置不完整")
+        return
+
+    try:
+        from qcloud_cos import CosConfig, CosS3Client
+    except Exception as error:
+        append_worker_log(
+            worker_log_path,
+            f"COS SDK 未就绪，尝试自动安装：{error}",
+        )
+        try:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--break-system-packages",
+                    "--disable-pip-version-check",
+                    "-i",
+                    "https://mirrors.cloud.tencent.com/pypi/simple",
+                    "cos-python-sdk-v5",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=180,
+                check=True,
+            )
+            from qcloud_cos import CosConfig, CosS3Client
+        except Exception as install_error:
+            append_worker_log(
+                worker_log_path,
+                (
+                    "COS 上传失败：无法导入或安装 COS SDK "
+                    f"{install_error}"
+                ),
+            )
+            return
+
+    artifact_root = user_directory.parent / "cos-artifacts"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+
+    for source_path, target_name in (
+        (status_path, "status.json"),
+        (task_log_path, "task.log"),
+        (worker_log_path, "worker.log"),
+        (manifest_path, "manifest.json"),
+    ):
+        if source_path.is_file():
+            (artifact_root / target_name).write_bytes(
+                source_path.read_bytes()
+            )
+
+    task_root = artifact_root / "task"
+    task_root.mkdir(parents=True, exist_ok=True)
+
+    if user_directory.is_dir():
+        for item in user_directory.iterdir():
+            if item.name == ".venv":
+                continue
+            target = task_root / item.name
+            if item.is_file():
+                target.write_bytes(item.read_bytes())
+
+    object_prefix = f"{prefix}/{config['task_id']}".strip("/")
+    upload_ok = False
+    last_error: BaseException | None = None
+
+    for attempt_number in range(3):
+        # attempt_number：当前上传尝试次数，从 0 开始
+        try:
+            credentials = get_instance_role_credentials(worker_log_path)
+            cos_config = CosConfig(
+                Region=region,
+                SecretId=credentials["TmpSecretId"],
+                SecretKey=credentials["TmpSecretKey"],
+                Token=credentials["Token"],
+                Scheme="https",
+            )
+            client = CosS3Client(cos_config)
+            for file_path in artifact_root.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                relative_name = file_path.relative_to(artifact_root).as_posix()
+                client.upload_file(
+                    Bucket=bucket,
+                    Key=f"{object_prefix}/{relative_name}",
+                    LocalFilePath=str(file_path),
+                )
+            upload_ok = True
+            break
+
+        except Exception as error:
+            last_error = error
+            append_worker_log(
+                worker_log_path,
+                (
+                    "COS 上传失败，"
+                    f"第 {attempt_number + 1} 次："
+                    f"{error.__class__.__name__}：{error}"
+                ),
+            )
+            if attempt_number >= 2:
+                break
+            if is_temporary_credential_error(error):
+                time.sleep(3)
+            else:
+                time.sleep(2 ** attempt_number)
+
+    if upload_ok:
+        append_worker_log(worker_log_path, "COS 上传完成")
+    elif last_error is not None:
+        append_worker_log(
+            worker_log_path,
+            (
+                "COS 上传最终失败，但不会阻止实例自销毁："
+                f"{last_error.__class__.__name__}：{last_error}"
+            ),
+        )
+
+
+def graceful_upload_window(max_use_seconds: int) -> int:
+    return max(30, min(300, max_use_seconds // 20))
 
 
 def stop_process_group(
@@ -1248,7 +1771,12 @@ def main() -> int:
                 ) = stop_process_group(
                     process=process,
                     grace_seconds=(
-                        terminate_grace_seconds
+                        max(
+                            terminate_grace_seconds,
+                            graceful_upload_window(
+                                max_use_seconds
+                            ),
+                        )
                     ),
                     worker_log_path=(
                         worker_log_path
@@ -1437,6 +1965,24 @@ def main() -> int:
             final_message,
         )
 
+        upload_task_artifacts(
+            config=config,
+            status_path=status_path,
+            task_log_path=task_log_path,
+            worker_log_path=worker_log_path,
+            manifest_path=manifest_path,
+            user_directory=user_directory,
+        )
+
+        # v0.1.4 修复：不要再依赖后台 helper 进程。
+        # 某些 SSH/远程执行环境会在 worker 退出时清理同一会话/进程组，
+        # 导致 self_destroy.py 根本没有机会运行，self_destroy.log 为空。
+        # 因此在 worker 退出前同步提交 TerminateInstances 请求。
+        terminate_current_instance(
+            config=config,
+            worker_log_path=worker_log_path,
+        )
+
         if final_status == "SUCCESS":
             return 0
 
@@ -1523,6 +2069,32 @@ def main() -> int:
                         f"{error.__class__.__name__}："
                         f"{error}"
                     ),
+                )
+            except Exception:
+                pass
+
+        if (
+            worker_log_path is not None
+            and config
+        ):
+            try:
+                if (
+                    status_path is not None
+                    and task_log_path is not None
+                    and manifest_path is not None
+                    and user_directory is not None
+                ):
+                    upload_task_artifacts(
+                        config=config,
+                        status_path=status_path,
+                        task_log_path=task_log_path,
+                        worker_log_path=worker_log_path,
+                        manifest_path=manifest_path,
+                        user_directory=user_directory,
+                    )
+                terminate_current_instance(
+                    config=config,
+                    worker_log_path=worker_log_path,
                 )
             except Exception:
                 pass

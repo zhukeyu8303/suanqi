@@ -6,7 +6,7 @@ for index in range(30):
         f"当前进度：{index + 1}/30",
         flush=True,
     )
-    time.sleep(5)
+    time.sleep(2)
 
 with open(
     "output.txt",

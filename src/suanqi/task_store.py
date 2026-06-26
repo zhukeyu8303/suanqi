@@ -54,8 +54,12 @@ def get_task_record_path(
 
     return (
         TASK_RECORD_DIRECTORY
-        / f"{safe_instance_id}.json"
+    / f"{safe_instance_id}.json"
     )
+
+
+CONFIG_DIRECTORY = Path.home() / ".suanqi"
+CONFIG_PATH = CONFIG_DIRECTORY / "config.json"
 
 
 def save_task_record(
@@ -145,6 +149,30 @@ def load_task_record(
 
     return data
 
+
+def list_task_records() -> list[dict[str, Any]]:
+    """列出全部本地任务记录。"""
+
+    if not TASK_RECORD_DIRECTORY.is_dir():
+        return []
+
+    records: list[dict[str, Any]] = []
+    for record_path in sorted(TASK_RECORD_DIRECTORY.glob("*.json")):
+        try:
+            with record_path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            if isinstance(data, dict):
+                data["_record_path"] = str(record_path)
+                records.append(data)
+        except Exception:
+            continue
+
+    records.sort(
+        key=lambda item: str(item.get("created_at") or item.get("updated_at") or ""),
+        reverse=True,
+    )
+    return records
+
 def update_task_record(
     instance_id: str,
     **changes: Any,
@@ -165,3 +193,32 @@ def update_task_record(
     )
 
     return record
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.is_file():
+        return {}
+    with CONFIG_PATH.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(config: dict[str, Any]) -> Path:
+    CONFIG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=CONFIG_DIRECTORY,
+            delete=False,
+        ) as temporary_file:
+            json.dump(config, temporary_file, ensure_ascii=False, indent=2)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+            temporary_path = Path(temporary_file.name)
+        os.replace(temporary_path, CONFIG_PATH)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+    return CONFIG_PATH

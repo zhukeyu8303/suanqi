@@ -1,45 +1,26 @@
-# SuanQi 腾讯云网关
+# SuanQi
 
-## 项目结构
-
-```text
-suanqi_gateway_complete/
-├── gateway/
-│   ├── __init__.py
-│   └── tencent_gateway.py
-├── main.py
-└── requirements.txt
-```
+SuanQi 是一个本地命令驱动的云计算任务执行工具，用于自动创建云服务器、上传 Python 任务、远程运行、回传结果并释放实例。
 
 ## 安装
 
 ```bash
-pip install -r requirements.txt
+pip install suanqi
 ```
 
-## PowerShell 配置密钥
-
-```powershell
-$env:TENCENTCLOUD_SECRET_ID="你的SecretId"
-$env:TENCENTCLOUD_SECRET_KEY="你的SecretKey"
-```
-
-## 运行
+## 常用命令
 
 ```bash
-python main.py
+suanqi useos
+suanqi run main.py --return output.txt
+suanqi run main.py --cpu 32 --memory 64 --maxusetime 2h
+suanqi attach ins-xxxxxxxx
+suanqi --list
+suanqi release ins-xxxxxxxx
 ```
 
-`main.py` 默认只查询和询价，不创建收费实例。
+## v0.1.4
 
-正式测试创建时，将：
-
-```python
-CREATE_INSTANCE = False
-```
-
-改为：
-
-```python
-CREATE_INSTANCE = True
-```
+- 修复 COS 上传后服务端自销毁未触发的问题。
+- worker 在退出前同步调用腾讯云 TerminateInstances。
+- COS 上传失败不再阻止实例释放。

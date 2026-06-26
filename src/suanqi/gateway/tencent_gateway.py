@@ -209,6 +209,21 @@ class TencentCloudGateway:
             return result
         return self._execute("DescribeAccountBalance", lambda: self._billing_client().DescribeAccountBalance(request), transform)
 
+    def get_user_app_id(self) -> GatewayResult:
+        request = cam_models.GetUserAppIdRequest()
+
+        def transform(data: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "app_id": data.get("AppId"),
+                "uin": data.get("Uin"),
+            }
+
+        return self._execute(
+            "GetUserAppId",
+            lambda: self._cam_client().GetUserAppId(request),
+            transform,
+        )
+
     def list_regions(self, product: str = "cvm", only_available: bool = True, scene: int = 1) -> GatewayResult:
         request = self._request(region_models.DescribeRegionsRequest, {"Product": product, "Scene": scene})
         def transform(data: dict[str, Any]) -> dict[str, Any]:
@@ -1066,6 +1081,197 @@ class TencentCloudGateway:
                 "cos_region": cos_region,
                 "cos_prefix": cos_prefix,
             },
+        )
+
+
+    def cos_bucket_exists(
+        self,
+        region: str,
+        bucket: str,
+    ) -> GatewayResult:
+        """检查 COS Bucket 是否存在。bucket 必须是完整名称，例如 suanqi-1250000000。"""
+        try:
+            self._cos_client(region).head_bucket(Bucket=bucket)
+            return GatewayResult(
+                True,
+                "COSHeadBucket",
+                data={"region": region, "bucket": bucket, "exists": True},
+            )
+        except CosServiceError as error:
+            code = getattr(error, "get_error_code", lambda: "CosServiceError")()
+            status = getattr(error, "get_status_code", lambda: None)()
+            if code in {"NoSuchBucket", "404"} or status == 404:
+                return GatewayResult(
+                    False,
+                    "COSHeadBucket",
+                    error_code="NoSuchBucket",
+                    error_message="COS Bucket 不存在",
+                    data={"region": region, "bucket": bucket, "exists": False},
+                    request_id=getattr(error, "get_request_id", lambda: None)(),
+                )
+            return GatewayResult(
+                False,
+                "COSHeadBucket",
+                error_code=code,
+                error_message=getattr(error, "get_error_msg", lambda: str(error))(),
+                request_id=getattr(error, "get_request_id", lambda: None)(),
+            )
+        except Exception as error:
+            return GatewayResult(
+                False,
+                "COSHeadBucket",
+                error_code=error.__class__.__name__,
+                error_message=str(error),
+            )
+
+    def ensure_cos_bucket(
+        self,
+        region: str,
+        bucket: str,
+    ) -> GatewayResult:
+        """确保 COS Bucket 存在；不存在则创建。"""
+        exists_result = self.cos_bucket_exists(region, bucket)
+        if exists_result.success:
+            return GatewayResult(
+                True,
+                "COSEnsureBucket",
+                data={"region": region, "bucket": bucket, "created": False},
+            )
+        if exists_result.error_code != "NoSuchBucket":
+            return exists_result
+
+        try:
+            self._cos_client(region).create_bucket(Bucket=bucket)
+            return GatewayResult(
+                True,
+                "COSEnsureBucket",
+                data={"region": region, "bucket": bucket, "created": True},
+            )
+        except CosServiceError as error:
+            code = getattr(error, "get_error_code", lambda: "CosServiceError")()
+            status = getattr(error, "get_status_code", lambda: None)()
+            # 并发或重复执行时，可能刚好已经创建成功。
+            if code in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"} or status == 409:
+                return GatewayResult(
+                    True,
+                    "COSEnsureBucket",
+                    data={"region": region, "bucket": bucket, "created": False},
+                )
+            return GatewayResult(
+                False,
+                "COSEnsureBucket",
+                error_code=code,
+                error_message=getattr(error, "get_error_msg", lambda: str(error))(),
+                request_id=getattr(error, "get_request_id", lambda: None)(),
+            )
+        except Exception as error:
+            return GatewayResult(
+                False,
+                "COSEnsureBucket",
+                error_code=error.__class__.__name__,
+                error_message=str(error),
+            )
+
+    def cos_upload_object(
+        self,
+        region: str,
+        bucket: str,
+        key: str,
+        local_path: str,
+    ) -> GatewayResult:
+        normalized_key = key.lstrip("/")
+        source_path = os.path.abspath(local_path)
+        if not os.path.isfile(source_path):
+            return GatewayResult(
+                False,
+                "COSUploadObject",
+                error_code="FileNotFoundError",
+                error_message=f"本地文件不存在：{source_path}",
+            )
+
+        try:
+            self._cos_client(region).upload_file(
+                Bucket=bucket,
+                Key=normalized_key,
+                LocalFilePath=source_path,
+            )
+            return GatewayResult(
+                True,
+                "COSUploadObject",
+                data={
+                    "region": region,
+                    "bucket": bucket,
+                    "key": normalized_key,
+                    "local_path": source_path,
+                    "size": os.path.getsize(source_path),
+                },
+            )
+        except CosServiceError as error:
+            return GatewayResult(
+                False,
+                "COSUploadObject",
+                error_code=getattr(error, "get_error_code", lambda: "CosServiceError")(),
+                error_message=getattr(error, "get_error_msg", lambda: str(error))(),
+                request_id=getattr(error, "get_request_id", lambda: None)(),
+            )
+        except Exception as error:
+            return GatewayResult(
+                False,
+                "COSUploadObject",
+                error_code=error.__class__.__name__,
+                error_message=str(error),
+            )
+
+    def cos_upload_directory(
+        self,
+        region: str,
+        bucket: str,
+        prefix: str,
+        local_directory: str,
+    ) -> GatewayResult:
+        normalized_prefix = prefix.strip().lstrip("/")
+        root = os.path.abspath(local_directory)
+        uploaded_files = []
+        failed_files = []
+
+        if not os.path.isdir(root):
+            return GatewayResult(
+                False,
+                "COSUploadDirectory",
+                error_code="FileNotFoundError",
+                error_message=f"本地目录不存在：{root}",
+            )
+
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                full_path = os.path.join(dirpath, filename)
+                relative_path = os.path.relpath(full_path, root).replace(os.sep, "/")
+                object_key = f"{normalized_prefix}/{relative_path}" if normalized_prefix else relative_path
+                upload_result = self.cos_upload_object(region, bucket, object_key, full_path)
+                if upload_result.success:
+                    uploaded_files.append(upload_result.data)
+                else:
+                    failed_files.append(
+                        {
+                            "key": object_key,
+                            "error_code": upload_result.error_code,
+                            "error_message": upload_result.error_message,
+                        }
+                    )
+
+        return GatewayResult(
+            len(failed_files) == 0,
+            "COSUploadDirectory",
+            data={
+                "region": region,
+                "bucket": bucket,
+                "prefix": normalized_prefix,
+                "local_directory": root,
+                "uploaded_files": uploaded_files,
+                "failed_files": failed_files,
+            },
+            error_code=None if not failed_files else "PartialUploadFailure",
+            error_message=None if not failed_files else f"{len(failed_files)} 个 COS 对象上传失败。",
         )
 
     # ------------------------------------------------------------------

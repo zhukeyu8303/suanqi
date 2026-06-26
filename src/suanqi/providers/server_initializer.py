@@ -167,6 +167,7 @@ def tencentcloud_creat(
     maximum_workers = 4,
     maximum_requests_per_second = 3,
     maximum_retry_count = 4,
+    cam_role_name: str | None = None,
 ) -> dict[Any, Any]:
     """执行腾讯云实例筛选、资源准备和并发询价。
 
@@ -1519,6 +1520,7 @@ def tencentcloud_creat(
         selected_candidate,
         instance_name="suanqi-task",
     )
+    create_config.cam_role_name = cam_role_name
 
 
 
@@ -1660,6 +1662,7 @@ def tencentcloud_creat(
         # 实例基本信息
         "instance_id": instance_id,
         "instance_name": create_config.instance_name,
+        "cam_role_name": create_config.cam_role_name,
         "instance_type": create_config.instance_type,
         "instance_status": instance_info["state"],
 

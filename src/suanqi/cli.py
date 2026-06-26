@@ -14,12 +14,17 @@ from .instance_manager import (
 from .providers import tencentcloud_run
 from .remote import (
     ServerInfo,
+    TaskCosTarget,
     WorkerTask,
     attach_worker_task,
+    download_cos_task_results,
     wait_for_ssh,
 )
 from .task_store import (
+    load_config,
+    list_task_records,
     load_task_record,
+    save_config,
     update_task_record,
 )
 from .utils.resource_utils import resolve_resource_requirements
@@ -249,6 +254,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    task_group.add_argument("--cos-bucket", default=None)
+    task_group.add_argument("--cos-region", default=None)
+    task_group.add_argument("--cos-prefix", default="tasks")
+    task_group.add_argument("--cos-resource-owner", default=None)
+
     attach_parser = subparsers.add_parser(
         "attach",
         help="重新连接已经启动的远程任务。",
@@ -301,6 +311,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跳过输入 RELEASE 的二次确认。",
     )
+
+    history_parser = subparsers.add_parser(
+        "history",
+        help="显示本地历史任务。",
+        description="列出保存在 ~/.suanqi/tasks 下的历史任务记录。",
+    )
+
+    fetch_parser = subparsers.add_parser(
+        "fetch",
+        help="从 COS 拉回任务结果。",
+        description="根据任务 ID 和 COS 参数从对象存储下载任务结果。",
+    )
+    fetch_parser.add_argument("task_id", metavar="TASK_ID")
+    fetch_parser.add_argument("--output", default=None)
+
+    useos_parser = subparsers.add_parser(
+        "useos",
+        help="启用并持久化 COS 存储桶。",
+        description="创建或绑定一个 SuanQi 专用 COS 存储桶配置。",
+    )
+    useos_parser.add_argument("--region", default="ap-nanjing")
+    useos_parser.add_argument("--bucket", default=None)
+    useos_parser.add_argument("--prefix", default="tasks")
+    useos_parser.add_argument("--resource-owner", default=None)
 
     return parser
 
@@ -550,6 +584,105 @@ def release_instance_command(
     return 0
 
 
+def history_command() -> int:
+    records = list_task_records()
+    if not records:
+        print("没有找到历史任务。")
+        return 0
+
+    for record in records:
+        print(
+            f"{record.get('task_id')} | "
+            f"{record.get('instance_id')} | "
+            f"{record.get('status')} | "
+            f"{record.get('created_at') or record.get('updated_at')}"
+        )
+    return 0
+
+
+def useos_command(region: str, bucket: str | None, prefix: str, resource_owner: str | None) -> int:
+    gateway = TencentCloudGateway()
+    app_id_result = gateway.get_user_app_id()
+    if not app_id_result.success:
+        print(f"获取 AppID 失败：{app_id_result.error_code}，{app_id_result.error_message}")
+        return 1
+
+    app_id = str(app_id_result.data.get("app_id") or "").strip()
+    if not app_id:
+        print("没有拿到 AppID。")
+        return 1
+
+    resolved_bucket = bucket or f"suanqi-{app_id}"
+    resolved_owner = resource_owner or app_id
+
+    bucket_result = gateway.ensure_cos_bucket(region, resolved_bucket)
+    if not bucket_result.success:
+        print(
+            "创建或检查 COS Bucket 失败："
+            f"{bucket_result.error_code}，{bucket_result.error_message}"
+        )
+        print("请确认 Bucket 名称必须是完整名称，例如 suanqi-1250000000，并且地域填写正确。")
+        return 1
+
+    role_result = gateway.ensure_suanqi_worker_role(
+        cos_bucket=resolved_bucket,
+        cos_region=region,
+        cos_resource_owner=resolved_owner,
+        cos_prefix=f"{prefix.strip('/') or 'tasks'}/*",
+    )
+    if not role_result.success:
+        print(f"配置实例角色失败：{role_result.error_code}，{role_result.error_message}")
+        return 1
+
+    config = load_config()
+    config["os"] = {
+        "enabled": True,
+        "region": region,
+        "bucket": resolved_bucket,
+        "prefix": prefix,
+        "resource_owner": resolved_owner,
+    }
+    save_config(config)
+
+    created_text = "已自动创建" if bucket_result.data.get("created") else "已存在"
+    print(f"已启用专用 COS：{resolved_bucket} / {region} / {prefix}（Bucket {created_text}）")
+    return 0
+
+
+def fetch_command(task_id: str, output: str | None) -> int:
+    record = None
+    for item in list_task_records():
+        if str(item.get("task_id") or "") == task_id:
+            record = item
+            break
+
+    config = load_config().get("os") or {}
+    cos_target = (record or {}).get("cos_target") or {}
+    region = str(cos_target.get("region") or config.get("region") or "")
+    bucket = str((record or {}).get("cos_bucket") or config.get("bucket") or "")
+    prefix = str((record or {}).get("cos_prefix") or config.get("prefix") or "tasks")
+
+    if not region or not bucket:
+        print("缺少 COS 参数，且本地专用 COS 配置或任务绑定信息里也没有可用配置。")
+        return 1
+
+    gateway = TencentCloudGateway()
+    local_dir = Path(output or (Path("suanqi-results") / task_id)).resolve()
+    result = download_cos_task_results(
+        gateway,
+        region=region,
+        bucket=bucket,
+        task_id=task_id,
+        local_directory=str(local_dir),
+        root_prefix=prefix,
+    )
+    if not result.success:
+        print(f"COS 下载失败：{result.error_code}，{result.error_message}")
+        return 1
+    print(f"已下载到：{local_dir}")
+    return 0
+
+
 def attach_command(
     instance_id: str,
 ) -> int:
@@ -776,6 +909,17 @@ def run_command(
         f"（{arguments.max_use_seconds} 秒）"
     )
 
+    os_config = load_config().get("os") or {}
+    cos_target = None
+    if bool(os_config.get("enabled")):
+        cos_target = TaskCosTarget(
+            region=str(os_config.get("region") or ""),
+            bucket=str(os_config.get("bucket") or ""),
+            prefix=str(os_config.get("prefix") or "tasks"),
+            resource_owner=str(os_config.get("resource_owner") or ""),
+            enabled=True,
+        )
+
     result = tencentcloud_run(
         python_file=arguments.python_file,
         requirements_file=(
@@ -792,6 +936,7 @@ def run_command(
         max_use_seconds=(
             arguments.max_use_seconds
         ),
+        cos_target=cos_target,
     )
 
     if not result:
@@ -910,6 +1055,23 @@ def main() -> int:
         return release_instance_command(
             instance_id=arguments.instance_id,
             skip_confirmation=arguments.yes,
+        )
+
+    if arguments.command == "history":
+        return history_command()
+
+    if arguments.command == "useos":
+        return useos_command(
+            region=arguments.region,
+            bucket=arguments.bucket,
+            prefix=arguments.prefix,
+            resource_owner=arguments.resource_owner,
+        )
+
+    if arguments.command == "fetch":
+        return fetch_command(
+            task_id=arguments.task_id,
+            output=arguments.output,
         )
 
     parser.print_help()

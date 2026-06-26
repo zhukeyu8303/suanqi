@@ -14,6 +14,7 @@ from suanqi.remote import (
     initialize_server,
     parse_server_info,
     prepare_python_task,
+    TaskCosTarget,
     start_worker_task,
     wait_for_ssh,
 )
@@ -37,6 +38,7 @@ def tencentcloud_run(
     maximum_region_instances: int = 10,
     keep_instance: bool = False,
     max_use_seconds: int = 5 * 60 * 60,
+    cos_target: TaskCosTarget | None = None,
 ) -> dict[str, Any]:
     """
     创建腾讯云实例并运行任务。
@@ -115,6 +117,11 @@ def tencentcloud_run(
             maximum_region_instances=(
                 maximum_region_instances
             ),
+            cam_role_name=(
+                "SuanQiWorkerRole"
+                if cos_target is not None and cos_target.enabled
+                else None
+            ),
         )
 
         if not create_result:
@@ -179,6 +186,7 @@ def tencentcloud_run(
             local_worker_path=(
                 worker_file
             ),
+            cos_target=cos_target,
             packages=(
                 packages or []
             ),

@@ -1,59 +1,41 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
-
 
 [project]
 name = "suanqi"
-version = "0.1.0"
-description = "Run compute tasks on temporary cloud servers from a local command."
+version = "0.1.4"
+description = "SuanQi: run local Python computing tasks on cloud servers and retrieve results."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
-license-files = ["LICENSE"]
-
+license = {text = "MIT"}
 authors = [
-    { name = "Keyu Zhu" }
+  {name = "SuanQi Project"}
 ]
-
-keywords = [
-    "cloud-computing",
-    "tencent-cloud",
-    "cvm",
-    "cli",
-    "remote-execution",
-    "spot-instance"
-]
-
+keywords = ["cloud", "compute", "cli", "tencentcloud", "cos"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
-    "Environment :: Console",
-    "Intended Audience :: Developers",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Topic :: System :: Distributed Computing",
-    "Topic :: System :: Systems Administration"
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Distributed Computing",
 ]
-
 dependencies = [
-    "tencentcloud-sdk-python>=3.0.0",
-    "datetime"
+  "paramiko>=3.0.0",
+  "tencentcloud-sdk-python>=3.0.0",
+  "cos-python-sdk-v5>=1.9.0",
 ]
-
-
-[project.urls]
-Homepage = "https://github.com/zhukeyu8303/SuanQi"
-Repository = "https://github.com/zhukeyu8303/SuanQi"
-Issues = "https://github.com/zhukeyu8303/SuanQi/issues"
-
 
 [project.scripts]
 suanqi = "suanqi.cli:main"
 
+[tool.setuptools]
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

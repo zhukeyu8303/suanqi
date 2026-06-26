@@ -79,6 +79,15 @@ class WorkerTask:
     manifest_path: str
 
 
+@dataclass(slots=True)
+class TaskCosTarget:
+    region: str
+    bucket: str
+    prefix: str
+    resource_owner: str | None = None
+    enabled: bool = False
+
+
 def parse_server_info(
     create_result: dict[str, Any],
 ) -> ServerInfo:
@@ -352,6 +361,12 @@ apt-get install -y \
     python3-pip \
     python3-venv \
     ca-certificates
+
+python3 -m pip install \
+    --break-system-packages \
+    --disable-pip-version-check \
+    -i https://mirrors.cloud.tencent.com/pypi/simple \
+    cos-python-sdk-v5 || true
 
 echo "SUANQI_INITIALIZATION_SUCCESS"
 """
@@ -906,6 +921,7 @@ def start_worker_task(
     task: PreparedTask,
     return_files: list[str],
     local_worker_path: str | Path,
+    cos_target: TaskCosTarget | None = None,
     packages: list[str] | None = None,
     max_use_seconds: int = 5 * 60 * 60,
     terminate_grace_seconds: int = 30,
@@ -986,6 +1002,18 @@ def start_worker_task(
     config = {
         "task_id": task.task_id,
 
+        "provider": server.provider,
+
+        "instance_region": server.region,
+
+        "instance_id": server.instance_id,
+
+        "enable_self_destroy": (
+            server.provider == "tencentcloud"
+        ),
+
+        "self_destroy_delay_seconds": 10,
+
         "user_directory": (
             task.user_directory
         ),
@@ -1018,6 +1046,17 @@ def start_worker_task(
 
         "preparation_timeout_seconds": (
             preparation_timeout_seconds
+        ),
+        "cos_target": (
+            {
+                "region": cos_target.region,
+                "bucket": cos_target.bucket,
+                "prefix": cos_target.prefix,
+                "resource_owner": cos_target.resource_owner,
+                "enabled": cos_target.enabled,
+            }
+            if cos_target is not None
+            else None
         ),
     }
 
@@ -1357,3 +1396,20 @@ def download_return_files(
             )
 
     return downloaded, missing
+
+
+def download_cos_task_results(
+    gateway: Any,
+    region: str,
+    bucket: str,
+    task_id: str,
+    local_directory: str,
+    root_prefix: str = "tasks",
+) -> Any:
+    return gateway.download_task_results(
+        region=region,
+        bucket=bucket,
+        task_id=task_id,
+        local_directory=local_directory,
+        root_prefix=root_prefix,
+    )
