@@ -69,6 +69,81 @@ SPOT_MAX_PRICE = "10.000"
 # 竞价实例最高愿意支付的价格
 
 
+# ============================================================
+# 终端输出工具
+# ============================================================
+
+def _print_stage(step: int, total: int, title: str) -> None:
+    """输出一个清晰的流程阶段标题。"""
+    print(f"\n[{step}/{total}] {title}")
+    print("-" * 58)
+
+
+def _print_status(message: str, status: str = "INFO") -> None:
+    """输出统一格式的状态信息。"""
+    labels = {
+        "INFO": "·",
+        "OK": "√",
+        "WARN": "!",
+        "ERROR": "×",
+    }
+    print(f"{labels.get(status, '·')} {message}")
+
+
+def _format_price(value: Any) -> str:
+    """将价格统一格式化为便于阅读的文本。"""
+    if value is None:
+        return "未知"
+    try:
+        return f"{float(value):.4f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _print_candidate_table(candidates: list[dict]) -> None:
+    """用对齐表格展示最终可选实例。"""
+    headers = ("序号", "地域 / 可用区", "配置", "机型", "价格（元/小时）")
+    rows = []
+    for index, item in enumerate(candidates, 1):
+        location = f"{item['region_name']} / {item['zone_name']}"
+        spec = f"{item['cpu']} 核 / {item['memory_gb']} GB"
+        rows.append((
+            str(index),
+            location,
+            spec,
+            str(item['instance_type']),
+            _format_price(item.get('effective_hourly_price')),
+        ))
+
+    widths = []
+    for column_index, header in enumerate(headers):
+        widths.append(max(
+            len(header),
+            max(len(row[column_index]) for row in rows),
+        ))
+
+    def render(row: tuple[str, ...]) -> str:
+        return "  ".join(
+            value.ljust(widths[index])
+            for index, value in enumerate(row)
+        )
+
+    print(render(headers))
+    print(render(tuple("-" * width for width in widths)))
+    for row in rows:
+        print(render(row))
+
+
+def _print_instance_summary(title: str, items: list[tuple[str, Any]]) -> None:
+    """输出键值对形式的实例摘要。"""
+    print(f"\n{title}")
+    print("=" * 58)
+    label_width = max(len(label) for label, _ in items)
+    for label, value in items:
+        print(f"{label.ljust(label_width)} : {value}")
+    print("=" * 58)
+
+
 
 #=============================================
 def _select_candidate(
@@ -197,27 +272,21 @@ def tencentcloud_creat(
     """
 
     gateway = TencentCloudGateway()
-    # ========================================================
-    # 2. 查询账户余额
-    # ========================================================
+    _print_stage(1, 6, "检查腾讯云账户")
 
     balance_result = gateway.get_account_balance()
 
     if balance_result.success:
-        print(
-            f"用户 UIN："
-            f"{balance_result.data['uin']}"
-        )
-
-        print(
-            f"用户余额："
-            f"{balance_result.data['real_balance_yuan']} 元"
+        _print_status(
+            f"账户余额：{balance_result.data['real_balance_yuan']} 元 "
+            f"(UIN {balance_result.data['uin']})",
+            "OK",
         )
     else:
-        print(
-            "查询账户余额失败："
-            f"{balance_result.error_code}，"
-            f"{balance_result.error_message}"
+        _print_status(
+            "余额查询失败，不影响继续筛选实例："
+            f"{balance_result.error_code}，{balance_result.error_message}",
+            "WARN",
         )
 
     # ========================================================
@@ -250,13 +319,13 @@ def tencentcloud_creat(
         print("允许的地域中没有可用地域。")
         return {}
 
-    print("\n本次查询地域：")
-
-    for item in region_list:
-        print(
-            f"- {item['region_name']} "
-            f"({item['region_code']})"
+    _print_stage(2, 6, "筛选可用资源")
+    _print_status(
+        "查询地域：" + "、".join(
+            f"{item['region_name']} ({item['region_code']})"
+            for item in region_list
         )
+    )
 
     # ========================================================
     # 4. 查询地域级实例机型
@@ -268,9 +337,8 @@ def tencentcloud_creat(
         region_code = region_info["region_code"]
         region_name = region_info["region_name"]
 
-        print(
-            f"\n正在查询地域机型："
-            f"{region_name} ({region_code})"
+        _print_status(
+            f"正在查询 {region_name} ({region_code}) 的可用机型……"
         )
 
         instance_types_result = (
@@ -334,22 +402,10 @@ def tencentcloud_creat(
         print("没有符合要求的机型。")
         return {}
 
-    print(
-        f"\n地域级候选机型数量："
-        f"{len(candidate_instance_types)}"
+    _print_status(
+        f"找到 {len(candidate_instance_types)} 个满足最低配置的地域级候选机型",
+        "OK",
     )
-
-    for index, item in enumerate(
-        candidate_instance_types,
-        1,
-    ):
-        print(
-            f"{index}. "
-            f"{item['region_name']} / "
-            f"{item['instance_type']} / "
-            f"{item['cpu']} 核 / "
-            f"{item['memory_gb']} GB"
-        )
 
     # ========================================================
     # 查询目标镜像
@@ -1013,10 +1069,9 @@ def tencentcloud_creat(
         print("\n没有可用于询价的候选配置。")
         return {}
 
-    print(
-        f"\n配置准备完成，共 "
-        f"{len(prepared_candidates)} 个候选，"
-        f"开始并发询价。"
+    _print_stage(3, 6, "查询竞价实例价格")
+    _print_status(
+        f"已准备 {len(prepared_candidates)} 个可用区级候选，开始并发询价"
     )
 
     # ========================================================
@@ -1123,8 +1178,6 @@ def tencentcloud_creat(
                     price_result.data.get("price")
                     or {}
                 )
-
-                print(price_data)
 
                 instance_price = (
                     price_data.get(
@@ -1277,25 +1330,20 @@ def tencentcloud_creat(
                 result = future.result()
 
             except Exception as error:
-                print(
-                    f"\n询价任务异常 "
-                    f"[{completed_count}/{total_count}]："
-                    f"{candidate['region_name']} / "
-                    f"{candidate['zone_name']} / "
-                    f"{candidate['instance_type']} / "
-                    f"{error}"
+                _print_status(
+                    f"询价异常 [{completed_count}/{total_count}] "
+                    f"{candidate['instance_type']}：{error}",
+                    "WARN",
                 )
                 continue
 
             if not result["success"]:
+                # 无库存或不支持竞价十分常见，只统计，不逐条刷屏。
                 print(
-                    f"\n询价失败 "
-                    f"[{completed_count}/{total_count}]："
-                    f"{candidate['region_name']} / "
-                    f"{candidate['zone_name']} / "
-                    f"{candidate['instance_type']} / "
-                    f"{result['error_code']}，"
-                    f"{result['error_message']}"
+                    f"\r· 询价进度：{completed_count}/{total_count}，"
+                    f"已获得 {len(price_candidates)} 个有效价格",
+                    end="",
+                    flush=True,
                 )
                 continue
 
@@ -1314,12 +1362,10 @@ def tencentcloud_creat(
             )
 
             print(
-                f"\n询价成功 "
-                f"[{completed_count}/{total_count}]："
-                f"{candidate['region_name']} / "
-                f"{candidate['zone_name']} / "
-                f"{candidate['instance_type']} / "
-                f"{effective_price} 元/小时"
+                f"\r· 询价进度：{completed_count}/{total_count}，"
+                f"已获得 {len(price_candidates)} 个有效价格",
+                end="",
+                flush=True,
             )
 
     # ========================================================
@@ -1341,25 +1387,14 @@ def tencentcloud_creat(
     )
 
 
-    print(
-        f"\n询价结束，成功 "
-        f"{len(price_candidates)} / "
-        f"{len(prepared_candidates)} 个。"
+    print()
+    _print_status(
+        f"询价完成：{len(price_candidates)} / {len(prepared_candidates)} 个候选可用",
+        "OK",
     )
 
-    print("\n按价格从低到高排序：")
-
-    for index, item in enumerate(
-        price_candidates,
-        1,
-    ):
-        print(
-            f"{index}. "
-            f"{item['region_name']} / "
-            f"{item['cpu']} 核 / "
-            f"{item['memory_gb']} GB / "
-            f"{item['effective_hourly_price']} 元/小时"
-        )
+    _print_stage(4, 6, "选择实例")
+    _print_candidate_table(price_candidates)
 
     selected_candidate = _select_candidate(
         price_candidates
@@ -1377,68 +1412,24 @@ def tencentcloud_creat(
         "effective_hourly_price"
     )
 
-    print("\n" + "=" * 70)
-    print("即将创建以下腾讯云实例")
-    print("=" * 70)
-
-    print(
-        f"地域："
-        f"{selected_candidate['region_name']} "
-        f"({selected_candidate['region_code']})"
+    _print_instance_summary(
+        "创建确认",
+        [
+            ("地域", f"{selected_candidate['region_name']} ({selected_candidate['region_code']})"),
+            ("可用区", f"{selected_candidate['zone_name']} ({selected_candidate['zone_code']})"),
+            ("实例配置", f"{selected_candidate['cpu']} 核 / {selected_candidate['memory_gb']} GB"),
+            ("实例机型", selected_candidate['instance_type']),
+            ("系统镜像", selected_candidate['image_name']),
+            ("系统盘", f"{SYSTEM_DISK_TYPE} / {SYSTEM_DISK_SIZE_GB} GiB"),
+            ("公网网络", f"{INTERNET_MAX_BANDWIDTH_MBPS} Mbps，按流量计费"),
+            ("实例计费", "竞价实例（SPOTPAID）"),
+            ("预计价格", f"{_format_price(hourly_price)} 元/小时"),
+        ],
     )
-
-    print(
-        f"可用区："
-        f"{selected_candidate['zone_name']} "
-        f"({selected_candidate['zone_code']})"
+    _print_status(
+        "竞价实例可能因资源或价格变化被腾讯云回收；确认后将创建真实收费资源。",
+        "WARN",
     )
-
-    print(
-        f"机型："
-        f"{selected_candidate['instance_type']}"
-    )
-
-    print(
-        f"配置："
-        f"{selected_candidate['cpu']} 核 / "
-        f"{selected_candidate['memory_gb']} GB"
-    )
-
-    print(
-        f"镜像："
-        f"{selected_candidate['image_name']} "
-        f"({selected_candidate['image_id']})"
-    )
-
-    print(
-        f"系统盘：{SYSTEM_DISK_TYPE} / {SYSTEM_DISK_SIZE_GB} GiB"
-    )
-
-    print(
-        f"公网：{"分配" if PUBLIC_IP_ASSIGNED else "不分配"}公网 IP / "
-        f"{"按流量计费" if INTERNET_CHARGE_TYPE=="TRAFFIC_POSTPAID_BY_HOUR" else "带宽计费"} / {INTERNET_MAX_BANDWIDTH_MBPS} Mbps 上限"
-    )
-
-    print(
-        f"询价结果：{hourly_price} 元/小时"
-    )
-
-    print(
-        f"VPC：{selected_candidate['vpc_id']}"
-    )
-
-    print(
-        f"子网："
-        f"{selected_candidate['subnet_name']} / "
-        f"{selected_candidate['subnet_cidr']}"
-    )
-
-    print(
-        f"安全组："
-        f"{selected_candidate['security_group_id']}"
-    )
-
-    print("\n警告：确认后将创建真实收费资源。")
 
     confirmation = input(
         "请输入 QIDONG（或“启动”） 确认创建，"
@@ -1453,9 +1444,8 @@ def tencentcloud_creat(
     # 创建前再次检查是否可售
     # ============================================================
 
-    print(
-        "\n正在进行创建前最终可售状态检查……"
-    )
+    _print_stage(5, 6, "创建云服务器")
+    _print_status("正在进行最终可售状态检查……")
 
     final_availability_result = (
         gateway.check_instance_available(
@@ -1511,9 +1501,9 @@ def tencentcloud_creat(
         )
         return {}
 
-    print(
-        f"创建前检查通过，"
-        f"当前状态：{final_sale_status}"
+    _print_status(
+        f"可售状态检查通过：{final_sale_status}",
+        "OK",
     )
 
     create_config = _build_instance_config(
@@ -1528,14 +1518,12 @@ def tencentcloud_creat(
     # 正式创建实例
     # ============================================================
 
-    print("\n正在提交实例创建请求……")
+    _print_status("正在提交实例创建请求……")
 
     create_result = gateway.run_instance(
         config=create_config,
         generate_password_if_missing=True,
     )
-
-    print(create_result)
 
     if not create_result.success:
         print(
@@ -1567,21 +1555,16 @@ def tencentcloud_creat(
         "client_token"
     )
 
-    print("\n实例创建请求已提交。")
-    print(f"实例 ID：{instance_id}")
-    print(f"幂等令牌：{client_token}")
-
-    print("\n请立即保存以下登录信息：")
-    print(f"用户名：ubuntu")
-    print(f"密码：{instance_password}")
+    _print_status(
+        f"创建请求已提交，实例 ID：{instance_id}",
+        "OK",
+    )
 
     # ============================================================
     # 等待实例创建完成
     # ============================================================
 
-    print(
-        "\n实例正在创建，等待进入 RUNNING 状态……"
-    )
+    _print_status("实例正在启动，等待进入 RUNNING 状态……")
 
     running_result = gateway.wait_instance_running(
         region=create_config.region,
@@ -1627,23 +1610,24 @@ def tencentcloud_creat(
         else None
     )
 
-    print("\n" + "=" * 70)
-    print("实例创建成功")
-    print("=" * 70)
-
-    print(f"实例 ID：{instance_id}")
-    print(f"实例状态：{instance_info['state']}")
-    print(f"公网 IP：{public_ip or '暂未分配'}")
-    print(f"内网 IP：{private_ip or '暂未分配'}")
-    print(f"登录密码：{instance_password}")
+    _print_stage(6, 6, "实例创建完成")
+    _print_instance_summary(
+        "服务器信息",
+        [
+            ("实例 ID", instance_id),
+            ("状态", instance_info['state']),
+            ("配置", f"{selected_candidate['cpu']} 核 / {selected_candidate['memory_gb']} GB"),
+            ("地域", f"{selected_candidate['region_name']} / {selected_candidate['zone_name']}"),
+            ("公网 IP", public_ip or "暂未分配"),
+            ("内网 IP", private_ip or "暂未分配"),
+            ("登录用户", "ubuntu"),
+        ],
+    )
 
     if public_ip:
-        print("\n可以尝试以下 SSH 命令：")
-        print(f"ssh ubuntu@{public_ip}")
+        _print_status(f"SSH：ssh ubuntu@{public_ip}")
     else:
-        print(
-            "\n实例已运行，但暂未查询到公网 IP。"
-        )
+        _print_status("实例已运行，但暂未查询到公网 IP", "WARN")
 
     return {
         # 执行结果
