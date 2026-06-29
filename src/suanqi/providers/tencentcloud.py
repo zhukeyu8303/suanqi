@@ -399,6 +399,14 @@ def tencentcloud_run(
                 or "远程守护进程运行失败"
             )
 
+        elif final_state == "UPLOAD_FAILED":
+            error_message = (
+                final_status.get(
+                    "message"
+                )
+                or "远程任务上传结果失败，实例已保留"
+            )
+
         elif final_state == "FAILED":
             error_message = (
                 final_status.get(
@@ -425,6 +433,10 @@ def tencentcloud_run(
         task_success = (
             final_state == "SUCCESS"
             and exit_code == 0
+        )
+        instance_kept = (
+            keep_instance
+            or final_state == "UPLOAD_FAILED"
         )
 
         try:
@@ -523,7 +535,7 @@ def tencentcloud_run(
             ),
 
             "instance_kept": (
-                keep_instance
+                instance_kept
             ),
         }
 
@@ -637,6 +649,7 @@ def tencentcloud_run(
             server is not None
             and not keep_instance
             and not detached
+            and final_state != "UPLOAD_FAILED"
         )
 
         if should_release_instance:
@@ -665,7 +678,7 @@ def tencentcloud_run(
 
         elif (
             server is not None
-            and keep_instance
+            and instance_kept
         ):
             print(
                 "\n服务器已保留，"
