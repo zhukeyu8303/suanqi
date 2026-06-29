@@ -769,6 +769,7 @@ def attach_worker_task(
         "FAILED",
         "TIMEOUT",
         "WORKER_FAILED",
+        "UPLOAD_FAILED",
     }
 
     last_status_name: str | None = None

@@ -161,6 +161,36 @@ def build_status(
     return data
 
 
+def build_finalizing_status(
+    config: dict[str, Any],
+    final_status: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    data = build_status(
+        config,
+        "FINALIZING",
+        final_status=final_status,
+        **extra,
+    )
+    data["message"] = "任务已完成，正在上传日志和结果"
+    return data
+
+
+def build_upload_failed_status(
+    config: dict[str, Any],
+    final_status: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    data = build_status(
+        config,
+        "UPLOAD_FAILED",
+        final_status=final_status,
+        **extra,
+    )
+    data["message"] = "任务已完成，但 COS 上传失败，实例已保留"
+    return data
+
+
 def validate_return_file(
     user_directory: Path,
     return_path: str,
@@ -623,9 +653,9 @@ def upload_task_artifacts(
     worker_log_path: Path,
     manifest_path: Path,
     user_directory: Path,
-) -> None:
+) -> bool:
     if not _cos_target_enabled(config):
-        return
+        return True
 
     cos_target = config.get("cos_target") or {}
     region = str(cos_target.get("region") or "")
@@ -634,7 +664,7 @@ def upload_task_artifacts(
 
     if not region or not bucket or not prefix:
         append_worker_log(worker_log_path, "COS 上传跳过：配置不完整")
-        return
+        return False
 
     try:
         from qcloud_cos import CosConfig, CosS3Client
@@ -670,7 +700,7 @@ def upload_task_artifacts(
                     f"{install_error}"
                 ),
             )
-            return
+            return False
 
     artifact_root = user_directory.parent / "cos-artifacts"
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -744,14 +774,18 @@ def upload_task_artifacts(
 
     if upload_ok:
         append_worker_log(worker_log_path, "COS 上传完成")
+        return True
     elif last_error is not None:
         append_worker_log(
             worker_log_path,
             (
-                "COS 上传最终失败，但不会阻止实例自销毁："
+                "COS 上传最终失败，实例将保留以避免结果丢失："
                 f"{last_error.__class__.__name__}：{last_error}"
             ),
         )
+        return False
+
+    return False
 
 
 def graceful_upload_window(max_use_seconds: int) -> int:
@@ -1835,58 +1869,6 @@ def main() -> int:
             )
 
         atomic_write_json(
-            status_path,
-            build_status(
-                config,
-                final_status,
-                worker_started_at=(
-                    worker_started_at
-                ),
-                preparation_started_at=(
-                    preparation_started_at
-                ),
-                preparation_finished_at=(
-                    preparation_finished_at
-                ),
-                started_at=(
-                    program_started_at
-                ),
-                finished_at=(
-                    finished_at
-                ),
-                worker_pid=(
-                    os.getpid()
-                ),
-                main_pid=(
-                    process.pid
-                    if process is not None
-                    else None
-                ),
-                exit_code=(
-                    exit_code
-                ),
-                max_use_seconds=(
-                    max_use_seconds
-                ),
-                preparation_timeout_seconds=(
-                    preparation_timeout_seconds
-                ),
-                terminate_grace_seconds=(
-                    terminate_grace_seconds
-                ),
-                timed_out=(
-                    timed_out
-                ),
-                forced_kill=(
-                    forced_kill
-                ),
-                message=(
-                    final_message
-                ),
-            ),
-        )
-
-        atomic_write_json(
             manifest_path,
             {
                 "task_id": (
@@ -1965,7 +1947,59 @@ def main() -> int:
             final_message,
         )
 
-        upload_task_artifacts(
+        atomic_write_json(
+            status_path,
+            build_finalizing_status(
+                config,
+                final_status,
+                worker_started_at=(
+                    worker_started_at
+                ),
+                preparation_started_at=(
+                    preparation_started_at
+                ),
+                preparation_finished_at=(
+                    preparation_finished_at
+                ),
+                started_at=(
+                    program_started_at
+                ),
+                finished_at=(
+                    finished_at
+                ),
+                worker_pid=(
+                    os.getpid()
+                ),
+                main_pid=(
+                    process.pid
+                    if process is not None
+                    else None
+                ),
+                exit_code=(
+                    exit_code
+                ),
+                max_use_seconds=(
+                    max_use_seconds
+                ),
+                preparation_timeout_seconds=(
+                    preparation_timeout_seconds
+                ),
+                terminate_grace_seconds=(
+                    terminate_grace_seconds
+                ),
+                timed_out=(
+                    timed_out
+                ),
+                forced_kill=(
+                    forced_kill
+                ),
+                message=(
+                    final_message
+                ),
+            ),
+        )
+
+        upload_ok = upload_task_artifacts(
             config=config,
             status_path=status_path,
             task_log_path=task_log_path,
@@ -1974,20 +2008,129 @@ def main() -> int:
             user_directory=user_directory,
         )
 
-        # v0.1.4 修复：不要再依赖后台 helper 进程。
-        # 某些 SSH/远程执行环境会在 worker 退出时清理同一会话/进程组，
-        # 导致 self_destroy.py 根本没有机会运行，self_destroy.log 为空。
-        # 因此在 worker 退出前同步提交 TerminateInstances 请求。
-        terminate_current_instance(
-            config=config,
-            worker_log_path=worker_log_path,
+        if upload_ok:
+            atomic_write_json(
+                status_path,
+                build_status(
+                    config,
+                    final_status,
+                    worker_started_at=(
+                        worker_started_at
+                    ),
+                    preparation_started_at=(
+                        preparation_started_at
+                    ),
+                    preparation_finished_at=(
+                        preparation_finished_at
+                    ),
+                    started_at=(
+                        program_started_at
+                    ),
+                    finished_at=(
+                        finished_at
+                    ),
+                    worker_pid=(
+                        os.getpid()
+                    ),
+                    main_pid=(
+                        process.pid
+                        if process is not None
+                        else None
+                    ),
+                    exit_code=(
+                        exit_code
+                    ),
+                    max_use_seconds=(
+                        max_use_seconds
+                    ),
+                    preparation_timeout_seconds=(
+                        preparation_timeout_seconds
+                    ),
+                    terminate_grace_seconds=(
+                        terminate_grace_seconds
+                    ),
+                    timed_out=(
+                        timed_out
+                    ),
+                    forced_kill=(
+                        forced_kill
+                    ),
+                    message=(
+                        final_message
+                    ),
+                ),
+            )
+
+            # COS 上传成功后再释放实例，避免结果还没上传完就被回收。
+            terminate_current_instance(
+                config=config,
+                worker_log_path=worker_log_path,
+            )
+
+            if final_status == "SUCCESS":
+                return 0
+
+            if final_status == "TIMEOUT":
+                return 124
+
+            return 1
+
+        append_worker_log(
+            worker_log_path,
+            "COS 上传未成功，跳过实例自销毁以保留现场",
         )
 
-        if final_status == "SUCCESS":
-            return 0
-
-        if final_status == "TIMEOUT":
-            return 124
+        atomic_write_json(
+            status_path,
+            build_upload_failed_status(
+                config,
+                final_status,
+                worker_started_at=(
+                    worker_started_at
+                ),
+                preparation_started_at=(
+                    preparation_started_at
+                ),
+                preparation_finished_at=(
+                    preparation_finished_at
+                ),
+                started_at=(
+                    program_started_at
+                ),
+                finished_at=(
+                    finished_at
+                ),
+                worker_pid=(
+                    os.getpid()
+                ),
+                main_pid=(
+                    process.pid
+                    if process is not None
+                    else None
+                ),
+                exit_code=(
+                    exit_code
+                ),
+                max_use_seconds=(
+                    max_use_seconds
+                ),
+                preparation_timeout_seconds=(
+                    preparation_timeout_seconds
+                ),
+                terminate_grace_seconds=(
+                    terminate_grace_seconds
+                ),
+                timed_out=(
+                    timed_out
+                ),
+                forced_kill=(
+                    forced_kill
+                ),
+                message=(
+                    final_message
+                ),
+            ),
+        )
 
         return 1
 
